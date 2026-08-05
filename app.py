@@ -37,20 +37,38 @@ with col1:
     st.plotly_chart(fig, width="stretch")
     st.metric(label="Calculated Air Enthalpy", value=f"{enthalpy} kJ/kg")
 
+# 5. Work Package 2: Context-Aware AI Tutor
 with col2:
-    st.subheader("🤖 Context-Aware AI Lab Assistant")
+    # Set up a mini-layout for the title and a Clear Button
+    title_col, btn_col = st.columns([3, 1])
+    with title_col:
+        st.subheader("🤖 Context-Aware AI Lab Assistant")
+    with btn_col:
+        if st.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.messages = [{"role": "assistant", "content": "Hi! I'm your AI HVAC tutor. Ask me anything about this experiment!"}]
+            st.rerun()
     
+    # Initialize chat history if it doesn't exist
     if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "assistant", "content": "Hi! I'm your AI HVAC tutor. Ask me anything about this experiment!"}]
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hi! I'm your AI HVAC tutor. Ask me anything about this experiment!"}
+        ]
 
-    for msg in st.session_state.messages:
-        st.chat_message(msg["role"]).write(msg["content"])
+    # Create a fixed-height scrollable container (matches the chart height perfectly)
+    chat_container = st.container(height=380)
 
+    # Render chat history INSIDE the scrollable container
+    with chat_container:
+        for msg in st.session_state.messages:
+            st.chat_message(msg["role"]).write(msg["content"])
+
+    # Handle new chat input
     if prompt := st.chat_input("Ask a question..."):
+        # Append user message to state and write it inside the container
         st.session_state.messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").write(prompt)
+        with chat_container:
+            st.chat_message("user").write(prompt)
 
-        # MOCK AI RESPONSE BASED ON LIVE DATA
         # COMPREHENSIVE MOCK AI RESPONSE ENGINE
         user_input = prompt.lower()
         
@@ -80,7 +98,6 @@ with col2:
             
         # 7. Psychrometrics: Dew Point & Condensation
         elif any(word in user_input for word in ["dew point", "condensation", "condense", "water phase", "dew"]):
-            # Rule of thumb calculation for realistic mock data
             dp_approx = round(dry_bulb - ((100 - rel_humidity) / 5), 1) 
             bot_reply = f"At {dry_bulb}°C and {rel_humidity}% RH, the approximate dew point is {dp_approx}°C. If the cooling coil surface temperature drops below {dp_approx}°C, moisture in the air will begin to condense into liquid water."
             
@@ -116,6 +133,11 @@ with col2:
         # 14. Catch-all / Fallback Engine
         else:
             bot_reply = f"That is a great question to explore in the lab! Based on your live data (Temp: {dry_bulb}°C, RH: {rel_humidity}%, Airflow: {airflow} m³/h), how do you think adjusting the heating or cooling coils would affect this process? Check the psychrometric chart on the left to see the current state point!"
+
+        # Append assistant message to state and write it inside the container
+        st.session_state.messages.append({"role": "assistant", "content": bot_reply})
+        with chat_container:
+            st.chat_message("assistant").write(bot_reply)
 
         st.session_state.messages.append({"role": "assistant", "content": bot_reply})
         st.chat_message("assistant").write(bot_reply)
