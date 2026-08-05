@@ -56,7 +56,7 @@ with col1:
         margin=dict(l=20, r=20, t=30, b=20)
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.metric(label="Calculated Air Enthalpy", value=f"{enthalpy} kJ/kg")
 
 # 5. Work Package 2: Context-Aware AI Tutor
