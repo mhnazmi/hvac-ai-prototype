@@ -70,7 +70,7 @@ with col2:
 
     # Render chat history
     except Exception as e:
-            bot_reply = f"*(API Error)*: {str(e)}"
+        bot_reply = f"*(API Error)*: {str(e)}"
 
     # Handle chat input
     if prompt := st.chat_input("Ask a question (e.g., 'Explain the process line for this reading')..."):
