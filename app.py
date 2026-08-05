@@ -138,6 +138,3 @@ with col2:
         st.session_state.messages.append({"role": "assistant", "content": bot_reply})
         with chat_container:
             st.chat_message("assistant").write(bot_reply)
-
-        st.session_state.messages.append({"role": "assistant", "content": bot_reply})
-        st.chat_message("assistant").write(bot_reply)
