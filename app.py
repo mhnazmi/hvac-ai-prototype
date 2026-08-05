@@ -69,8 +69,8 @@ with col2:
         ]
 
     # Render chat history
-    for msg in st.session_state.messages:
-        st.chat_message(msg["role"]).write(msg["content"])
+    except Exception as e:
+            bot_reply = f"*(API Error)*: {str(e)}"
 
     # Handle chat input
     if prompt := st.chat_input("Ask a question (e.g., 'Explain the process line for this reading')..."):
