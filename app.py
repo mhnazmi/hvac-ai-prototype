@@ -69,15 +69,15 @@ with col2:
         ]
 
     # Render chat history
-    except Exception as e:
-        bot_reply = f"*(API Error)*: {str(e)}"
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
 
     # Handle chat input
     if prompt := st.chat_input("Ask a question (e.g., 'Explain the process line for this reading')..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         st.chat_message("user").write(prompt)
 
-        # Connect to Gemini API if key exists, otherwise fallback gracefully
+        # Connect to Gemini API if key exists, otherwise print exact error
         api_key = st.secrets.get("GEMINI_API_KEY", None)
         
         if api_key:
@@ -92,10 +92,9 @@ with col2:
                 )
                 bot_reply = response.text
             except Exception as e:
-                bot_reply = f"*(API Note: Unable to reach Gemini backend. Fallback response)*\nAt {dry_bulb}°C and {rel_humidity}% RH, the air is holding a specific amount of water vapor. If cooled below its dew point, moisture will condense on the AHU coil."
+                bot_reply = f"*(API Error)*: {str(e)}"
         else:
-            # Fallback response for assessors if API key isn't provided
-            bot_reply = f"**AI Tutor Answer:** Based on your current live inputs ({dry_bulb}°C and {rel_humidity}% RH), the specific humidity is within standard operating thresholds. Refer to Section 3 of your lab manual to verify cooling coil discharge specs."
+            bot_reply = f"*(No API Key Found)*: `GEMINI_API_KEY` was not detected in Streamlit Secrets."
 
         st.session_state.messages.append({"role": "assistant", "content": bot_reply})
         st.chat_message("assistant").write(bot_reply)
