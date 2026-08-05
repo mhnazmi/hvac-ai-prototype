@@ -43,6 +43,15 @@ with col2:
     title_col, btn_col = st.columns([3, 1])
     with title_col:
         st.subheader("🤖 Context-Aware AI Lab Assistant")
+    with st.expander("💡 View Suggested Lab Inquiries", expanded=False):
+        st.markdown("""
+        **Try asking the AI Tutor:**
+        * "What is the current dry bulb **temperature**?"
+        * "How is the total **enthalpy** calculated here?"
+        * "At what point will **condensation** occur on the coil?"
+        * "What internal components make up the **AHU**?"
+        * "Can you run a diagnostic and check for any **faults**?"
+        """)
     with btn_col:
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = [{"role": "assistant", "content": "Hi! I'm your AI HVAC tutor. Ask me anything about this experiment!"}]
@@ -51,7 +60,7 @@ with col2:
     # Initialize chat history if it doesn't exist
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "Hi! I'm your AI HVAC tutor. Ask me anything about this experiment!"}
+            {"role": "assistant", "content": "Hi! I'm your AI HVAC Lab Assistant. You can adjust the live sensors on the left, and then ask me to calculate **enthalpy**, check for **condensation**, explain the **cooling coil**, or run a **diagnostic**!"}
         ]
 
     # Create a fixed-height scrollable container (matches the chart height perfectly)
@@ -63,7 +72,7 @@ with col2:
             st.chat_message(msg["role"]).write(msg["content"])
 
     # Handle new chat input
-    if prompt := st.chat_input("Ask a question..."):
+    if prompt := st.chat_input("Ask about humidity, enthalpy, faults, or the AHU..."):
         # Append user message to state and write it inside the container
         st.session_state.messages.append({"role": "user", "content": prompt})
         with chat_container:
