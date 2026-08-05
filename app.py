@@ -87,9 +87,8 @@ with col2:
                 system_instruction = f"You are an AI HVAC tutor in a university lab. The current sensor readings are: Dry Bulb Temp = {dry_bulb}°C, Relative Humidity = {rel_humidity}%, Airflow = {airflow} m³/h. Use this context to answer concisely."
                 
                 response = client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=f"{system_instruction}\nUser question: {prompt}"
-                    )
+                    model='gemini-1.5-flash',
+                    contents=f"{system_instruction}\nUser question: {prompt}"
                 )
                 bot_reply = response.text
             except Exception as e:
