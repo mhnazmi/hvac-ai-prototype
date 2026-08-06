@@ -1,3 +1,4 @@
 streamlit
 plotly
+psychrolib
 google-genai
