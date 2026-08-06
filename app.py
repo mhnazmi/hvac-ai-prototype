@@ -15,6 +15,7 @@ correlations are used anywhere in this file.
 import os
 import json
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 import psychrolib as psy
 
@@ -718,7 +719,7 @@ tab3, tab1, tab2 = st.tabs([
 with tab3:
     c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(psych_chart(sim), width="stretch")
+        st.plotly_chart(psych_chart(sim), use_container_width=True)
         st.caption("Solid blue = saturation curve. Dotted grey = constant RH. "
                    "Dashed purple = constant enthalpy. Red X = apparatus dew point.")
     with c2:
@@ -730,7 +731,7 @@ with tab3:
             "T dp (C)": round(s["t_dp"], 1), "T wb (C)": round(s["t_wb"], 1),
             "v (m3/kg)": round(s["v"], 4),
         } for i, s in enumerate(sim["states"])], hide_index=True,
-            width="stretch")
+            use_container_width=True)
 
         st.markdown("**Cooling coil heat transfer**")
         st.dataframe([
@@ -740,12 +741,12 @@ with tab3:
             {"Quantity": "Sensible heat ratio", "Value": f"{sim['shr']:.3f}"},
             {"Quantity": "Apparatus dew point", "Value": f"{sim['t_adp']:.2f} C"},
             {"Quantity": "Bypass factor", "Value": f"{sim['bypass']:.3f}"},
-        ], hide_index=True, width="stretch")
+        ], hide_index=True, use_container_width=True)
 
         st.download_button(
             "Export analysis (JSON)", build_context(sim, controls),
             file_name="hvac_analysis.json", mime="application/json",
-            width="stretch")
+            use_container_width=True)
 
 # ---- WP1 ------------------------------------------------------------------
 with tab1:
@@ -753,9 +754,7 @@ with tab1:
                 "sensor badge are driven by the same simulation core as the chart.")
     # components.v1.html renders in an iframe with no sanitisation, so the
     # SVG animation tags survive. st.html() strips them and shows nothing.
-    components.html(ahu_svg(sim), height=290)
-    # st.iframe replaces the deprecated components.v1.html to render without sanitisation so the SVG animation tags survive.
-    st.iframe(ahu_svg(sim), height=290, scrolling=False)
+    components.html(ahu_svg(sim), height=290, scrolling=False)
     st.caption("Streamline animation rate scales with delivered airflow. Droplets "
                "appear only when the coil surface falls below the intake dew point. "
                "The coil outline turns red when its bypass factor degrades.")
@@ -780,7 +779,7 @@ with tab2:
     hcol.markdown("**Context-aware tutor.** The full digital twin state is injected "
                   "into the model's context on every turn, so answers cite live "
                   "measured values rather than generic HVAC theory.")
-    if bcol.button("Clear chat", width="stretch"):
+    if bcol.button("Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
