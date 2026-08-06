@@ -754,7 +754,7 @@ with tab1:
                 "sensor badge are driven by the same simulation core as the chart.")
     # components.v1.html renders in an iframe with no sanitisation, so the
     # SVG animation tags survive. st.html() strips them and shows nothing.
-    components.html(ahu_svg(sim), height=290, scrolling=False)
+    components.html(ahu_svg(sim), height=400, scrolling=False)
     st.caption("Streamline animation rate scales with delivered airflow. Droplets "
                "appear only when the coil surface falls below the intake dew point. "
                "The coil outline turns red when its bypass factor degrades.")
