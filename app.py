@@ -598,7 +598,7 @@ def ask_llm(question, sim, controls, history):
 
 
 def offline_answer(question, sim, controls):
-    """Deterministic fallback. Unlike the original keyword matcher, every number
+    """Deterministic fallback. Unlike a keyword matcher, every number
     here is read from the simulation core rather than invented."""
     q = question.lower()
     s1, s2, s3, s4 = sim["states"]
