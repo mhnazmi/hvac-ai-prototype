@@ -751,6 +751,9 @@ with tab3:
 with tab1:
     st.markdown("**Live AHU cutaway** - airflow speed, coil condensate and every "
                 "sensor badge are driven by the same simulation core as the chart.")
+    # components.v1.html renders in an iframe with no sanitisation, so the
+    # SVG animation tags survive. st.html() strips them and shows nothing.
+    components.html(ahu_svg(sim), height=290)
     # st.iframe replaces the deprecated components.v1.html to render without sanitisation so the SVG animation tags survive.
     st.iframe(ahu_svg(sim), height=290, scrolling=False)
     st.caption("Streamline animation rate scales with delivered airflow. Droplets "
