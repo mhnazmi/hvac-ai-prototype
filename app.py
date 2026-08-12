@@ -1336,14 +1336,14 @@ k5.metric("Mass Flow", f"{sim['m_dot']:.3f} kg/s")
 
 st.divider()
 
-tab1, tab2, tab3, tab_quiz = st.tabs([
+tab1, tab3, tab2, tab_quiz = st.tabs([
     "WP1 - Immersive AHU Environment",
     "WP2 - Psychrometric Visualization",
     "WP3 - AI Learning Assistant",
     "Student Quiz"])
 
 # ---- WP3 ------------------------------------------------------------------
-with tab3:
+with tab2:
     with st.expander(
             ("LIVE" if live_mode else "SIMULATED") + " data source - "
             + ("streaming from sensor feed" if live_mode else "digital twin (sliders)"),
@@ -1484,7 +1484,7 @@ with tab1:
                     "paths separate; sensor faults surface as physical-consistency errors.")
 
 # ---- WP2 (student quiz lives here too) ------------------------------------
-with tab2:
+with tab3:
     hcol, bcol = st.columns([4, 1])
     hcol.markdown("**Context-aware tutor.** The full digital twin state is injected "
                   "into the model's context on every turn, so answers cite live "
