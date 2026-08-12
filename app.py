@@ -548,7 +548,7 @@ def ahu_svg(sim, selected=None):
         'repeatCount="indefinite"/></path>')
 
     css = "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" \
-          "svg{display:block;width:100%;height:95vh;}" \
+          "svg{display:block;width:100%;height:auto;}" \
           'text{font-family:"Source Sans Pro",system-ui,sans-serif;}'
 
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><style>{css}</style></head>
@@ -1039,6 +1039,107 @@ def sim_from_readings(r):
 
 
 # ==========================================================================
+# GUIDED LEARNING SCENARIOS  (WP1: self-directed, task-based learning)
+# ==========================================================================
+# Each scenario presets the rig to a starting condition (slider values, and
+# optionally a silently-injected fault), frames a task, walks the student
+# through what to do and observe, and self-checks understanding. This is the
+# self-directed student mode.
+
+SCENARIOS = [
+    {
+        "id": "dehumidify",
+        "title": "Humid day - hit the dehumidification target",
+        "situation": "A hot, humid day: intake air is 32 deg C at 75% RH and the "
+                     "chilled water is running warm at 14 deg C. The coil is only lightly "
+                     "dehumidifying and the supply air is still too moist for the chamber. "
+                     "Your job is to increase the dehumidification.",
+        "objective": "Understand how the chilled-water temperature sets the apparatus "
+                     "dew point, and how lowering it pushes the coil surface further "
+                     "below the intake dew point so more moisture condenses out.",
+        "controls": {"t_intake": 32.0, "rh_intake": 75.0, "airflow": 500,
+                     "t_chw": 14.0, "reheat_kw": 1.0, "humid_kgh": 0.0},
+        "faults": [],
+        "steps": [
+            "Open the WP3 tab. Read the coil outlet point (2) - some moisture is being "
+            "removed, but is it enough? Note the condensate rate on the schematic.",
+            "Back in the sidebar, lower the Chilled Water Temp slider from 14 toward "
+            "7 deg C and watch the apparatus dew point (ADP) drop further below the "
+            "intake dew point.",
+            "Watch the condensate rate climb, the supply humidity ratio fall further, "
+            "and the measured process on the chart bend more steeply downward.",
+        ],
+        "check": {
+            "q": "What increased the dehumidification?",
+            "options": ["Lowering the chilled-water temperature",
+                        "Increasing the reheat duty",
+                        "Increasing the airflow"],
+            "answer": "Lowering the chilled-water temperature",
+            "why": "It dropped the apparatus dew point further below the intake dew "
+                   "point, so more moisture condenses on the coil.",
+            "hint": "Look at what has to happen to the coil surface temperature for "
+                    "more water to condense out of the air.",
+        },
+        "explanation": "At 14 deg C chilled water the apparatus dew point is only a "
+                       "little below the intake dew point, so the coil removes just a "
+                       "modest amount of moisture. As you lower the chilled water, the "
+                       "ADP drops further below the intake dew point, the condensate "
+                       "rate rises, the humidity ratio falls further, and the coil load "
+                       "shifts toward latent (the SHR drops).",
+    },
+    {
+        "id": "coil_fault",
+        "title": "Fault-finding - why is the supply air warm?",
+        "situation": "Students report the chamber isn't cooling properly. The setpoints "
+                     "look normal - 32 deg C / 70% intake, 7 deg C chilled water - but "
+                     "something in the plant is off. Diagnose it from the symptoms, using "
+                     "the schematic, the chart and the diagnostics. You are not told what "
+                     "the fault is.",
+        "objective": "Practise diagnosing a coil fault from its signature: a warm coil "
+                     "outlet, a raised bypass factor, and a measured process that has "
+                     "pulled away from the theoretical clean plant.",
+        "controls": {"t_intake": 32.0, "rh_intake": 70.0, "airflow": 500,
+                     "t_chw": 7.0, "reheat_kw": 1.5, "humid_kgh": 0.5},
+        "faults": ["Fouled cooling coil"],
+        "steps": [
+            "Look at the cooling coil on the WP1 schematic - what colour is it, and what "
+            "does that colour indicate?",
+            "Read the diagnostics banner and the coil-outlet temperature (point 2). Is "
+            "the air leaving the coil colder or warmer than a healthy coil would give?",
+            "Open the WP3 tab - how far has the red measured process separated from the "
+            "dashed green theoretical clean-plant process?",
+        ],
+        "check": {
+            "q": "What is the most likely fault?",
+            "options": ["Fouled cooling coil", "Humidifier stuck on", "Low airflow"],
+            "answer": "Fouled cooling coil",
+            "why": "The coil bypass factor has risen from 0.12 to about 0.38, so more "
+                   "air slips through untreated and leaves warmer and wetter.",
+            "hint": "A red coil, a warm coil outlet, and a big measured-vs-theoretical "
+                    "gap all point at the coil itself, not the fan or humidifier.",
+        },
+        "explanation": "A fouled coil raises the bypass factor from 0.12 to ~0.38: a "
+                       "larger fraction of air passes through without touching the cold "
+                       "fins, so the coil outlet is warmer and drier than it should be. "
+                       "The schematic shows the coil in red, the diagnostics flag coil "
+                       "underperformance, and on the chart the measured process sits well "
+                       "away from the theoretical clean-plant line.",
+    },
+]
+SCENARIOS_BY_ID = {s["id"]: s for s in SCENARIOS}
+
+
+def apply_scenario(scn):
+    for key, val in scn["controls"].items():
+        st.session_state[key] = val
+    st.session_state["active_scenario"] = scn["id"]
+
+
+def clear_scenario():
+    st.session_state["active_scenario"] = None
+
+
+# ==========================================================================
 # UI
 # ==========================================================================
 
@@ -1048,9 +1149,10 @@ st.caption("Real-Time Digital Twin | ASHRAE Psychrometrics | AI Assistant & Diag
 with st.sidebar:
     st.header("Learning Mode")
     mode = st.radio(
-        "Mode", ["Guided walkthrough", "Student self-learning", "Instructor demonstration"],
+        "Mode", ["Guided walkthrough", "Guided scenarios", "Instructor demonstration"],
         label_visibility="collapsed",
-        help="Instructor mode unlocks fault injection and quiz answer keys.")
+        help="Guided scenarios is the self-directed student mode. Instructor mode "
+             "unlocks fault injection and quiz answer keys.")
     instructor = mode == "Instructor demonstration"
 
     st.divider()
@@ -1081,14 +1183,14 @@ with st.sidebar:
                    "sliders drive the theoretical reference model.")
     else:
         st.caption("Intake conditions")
-    t_intake = st.slider("Intake Dry Bulb (deg C)", 15.0, 45.0, 32.0, 0.5)
-    rh_intake = st.slider("Intake Relative Humidity (%)", 20.0, 95.0, 70.0, 1.0)
-    airflow = st.slider("Airflow Setpoint (m3/h)", 100, 1000, 500, 25)
+    t_intake = st.slider("Intake Dry Bulb (deg C)", 15.0, 45.0, 32.0, 0.5, key="t_intake")
+    rh_intake = st.slider("Intake Relative Humidity (%)", 20.0, 95.0, 70.0, 1.0, key="rh_intake")
+    airflow = st.slider("Airflow Setpoint (m3/h)", 100, 1000, 500, 25, key="airflow")
 
     st.caption("Plant setpoints")
-    t_chw = st.slider("Chilled Water Temp (deg C)", 4.0, 20.0, 7.0, 0.5)
-    reheat_kw = st.slider("Reheat Duty (kW)", 0.0, 5.0, 1.5, 0.1)
-    humid_kgh = st.slider("Humidifier Output (kg/h)", 0.0, 6.0, 0.5, 0.1)
+    t_chw = st.slider("Chilled Water Temp (deg C)", 4.0, 20.0, 7.0, 0.5, key="t_chw")
+    reheat_kw = st.slider("Reheat Duty (kW)", 0.0, 5.0, 1.5, 0.1, key="reheat_kw")
+    humid_kgh = st.slider("Humidifier Output (kg/h)", 0.0, 6.0, 0.5, 0.1, key="humid_kgh")
 
     faults, sensor_faults = [], []
     if instructor:
@@ -1146,6 +1248,10 @@ if live_mode:
         live_mode = False                        # graceful fallback to simulated
 
 if not live_mode:
+    active_scn = st.session_state.get("active_scenario")
+    scenario_faults = SCENARIOS_BY_ID[active_scn]["faults"] \
+        if active_scn in SCENARIOS_BY_ID else []
+    faults = list(dict.fromkeys(faults + scenario_faults))   # merge, dedupe
     controls = {
         "intake_dry_bulb_C": t_intake, "intake_RH_pct": rh_intake,
         "airflow_setpoint": airflow, "chilled_water_C": t_chw,
@@ -1274,7 +1380,7 @@ with tab1:
                 "same simulation core as the chart.")
 
     selected = st.selectbox("Select a component to inspect", COMPONENTS, index=2)
-    components.html(ahu_svg(sim, selected), height=650)
+    components.html(ahu_svg(sim, selected), height=560, scrolling=False)
     st.info(component_detail(selected, sim))
     st.caption("Streamline animation rate scales with delivered airflow. Droplets appear "
                "only when the coil surface falls below the intake dew point. The coil "
@@ -1298,6 +1404,42 @@ with tab1:
             with st.expander(f"Step: {name}"):
                 st.markdown(component_detail(name, sim))
                 st.markdown(txt)
+    elif mode == "Guided scenarios":
+        st.markdown("### Guided learning scenarios")
+        st.caption("Self-directed learning: pick a scenario, load it to set the rig to "
+                   "its starting condition, then work through the steps. Scenarios drive "
+                   "the simulated rig - set Data Source to Simulated for the intended "
+                   "experience.")
+        titles = [s["title"] for s in SCENARIOS]
+        pick = st.selectbox("Scenario", titles, key="scn_pick")
+        scn = SCENARIOS[titles.index(pick)]
+
+        b1, b2 = st.columns(2)
+        b1.button("Load scenario", on_click=apply_scenario, args=(scn,),
+                  use_container_width=True)
+        b2.button("Clear scenario", on_click=clear_scenario, use_container_width=True)
+        if st.session_state.get("active_scenario") == scn["id"]:
+            st.success("Scenario loaded - the rig is set to the starting conditions. "
+                       "Adjust the sliders as the steps direct.")
+        elif live_mode:
+            st.warning("You are in Live ingestion mode. Switch Data Source to "
+                       "Simulated so the scenario's conditions drive the rig.")
+
+        st.markdown(f"**Situation.** {scn['situation']}")
+        st.markdown(f"**Learning objective.** {scn['objective']}")
+        st.markdown("**Steps**")
+        for i, step_txt in enumerate(scn["steps"], 1):
+            st.markdown(f"{i}. {step_txt}")
+
+        chk = scn["check"]
+        ans = st.radio(chk["q"], chk["options"], index=None, key=f"scn_check_{scn['id']}")
+        if ans is not None:
+            if ans == chk["answer"]:
+                st.success(f"Correct. {chk['why']}")
+            else:
+                st.info(f"Not quite - {chk['hint']}")
+        with st.expander("Explanation - what you should see"):
+            st.markdown(scn["explanation"])
     elif mode == "Instructor demonstration":
         st.markdown("### Instructor notes")
         st.markdown("Inject a plant or sensor fault from the sidebar and ask students to "
