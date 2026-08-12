@@ -4,8 +4,8 @@ AI-Enabled Intelligent HVAC Learning Platform
 One simulation core (the AHU digital twin) feeding three work packages:
 
   WP1 - Immersive Virtual Learning Environment  -> interactive AHU schematic
-  WP2 - AI Learning Assistant                   -> context-aware LLM tutor
-  WP3 - Intelligent Psychrometric Visualization -> ASHRAE psychrometric chart
+  WP2 - Intelligent Psychrometric Visualization -> ASHRAE psychrometric chart
+  WP3 - AI Learning Assistant                   -> context-aware LLM tutor
 
 All psychrometric properties are computed with PsychroLib, an implementation of
 the ASHRAE Handbook of Fundamentals (2017) formulations. No hand-rolled
@@ -1099,7 +1099,7 @@ SCENARIOS = [
                      "t_chw": 14.0, "reheat_kw": 1.0, "humid_kgh": 0.0},
         "faults": [],
         "steps": [
-            "Open the WP3 tab. Read the coil outlet point (2) - some moisture is being "
+            "Open the WP2 tab. Read the coil outlet point (2) - some moisture is being "
             "removed, but is it enough? Note the condensate rate on the schematic.",
             "Back in the sidebar, lower the Chilled Water Temp slider from 14 toward "
             "7 deg C and watch the apparatus dew point (ADP) drop further below the "
@@ -1144,7 +1144,7 @@ SCENARIOS = [
             "does that colour indicate?",
             "Read the diagnostics banner and the coil-outlet temperature (point 2). Is "
             "the air leaving the coil colder or warmer than a healthy coil would give?",
-            "Open the WP3 tab - how far has the red measured process separated from the "
+            "Open the WP2 tab - how far has the red measured process separated from the "
             "dashed green theoretical clean-plant process?",
         ],
         "check": {
@@ -1342,8 +1342,8 @@ tab1, tab3, tab2, tab_quiz = st.tabs([
     "WP3 - AI Learning Assistant",
     "Student Quiz"])
 
-# ---- WP3 ------------------------------------------------------------------
-with tab2:
+# ---- WP2 tab: Psychrometric Visualization --------------------------------
+with tab3:
     with st.expander(
             ("LIVE" if live_mode else "SIMULATED") + " data source - "
             + ("streaming from sensor feed" if live_mode else "digital twin (sliders)"),
@@ -1483,8 +1483,8 @@ with tab1:
                     "coil turns red for a fouled coil; the chart's actual vs theoretical "
                     "paths separate; sensor faults surface as physical-consistency errors.")
 
-# ---- WP2 (student quiz lives here too) ------------------------------------
-with tab3:
+# ---- WP3 tab: AI Learning Assistant --------------------------------------
+with tab2:
     hcol, bcol = st.columns([4, 1])
     hcol.markdown("**Context-aware tutor.** The full digital twin state is injected "
                   "into the model's context on every turn, so answers cite live "
