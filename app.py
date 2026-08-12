@@ -548,11 +548,13 @@ def ahu_svg(sim, selected=None):
         'repeatCount="indefinite"/></path>')
 
     css = "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" \
-          "svg{display:block;width:100%;height:auto;}" \
+          ".ahu-wrap{position:relative;width:100%;max-width:1100px;margin:0 auto;" \
+          "aspect-ratio:860/330;}" \
+          ".ahu-wrap svg{position:absolute;inset:0;width:100%;height:100%;display:block;}" \
           'text{font-family:"Source Sans Pro",system-ui,sans-serif;}'
 
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><style>{css}</style></head>
-    <body><svg viewBox="0 0 860 330" preserveAspectRatio="xMidYMid meet"
+    <body><div class="ahu-wrap"><svg viewBox="0 0 860 330" preserveAspectRatio="xMidYMid meet"
          xmlns="http://www.w3.org/2000/svg">
       <defs><marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="2.4"
         orient="auto"><path d="M0,0 L0,4.8 L6,2.4 z" fill="#6ee7ff"/></marker></defs>
@@ -640,7 +642,20 @@ def ahu_svg(sim, selected=None):
       {badge(300, s2, "#4cc9f0")}
       {badge(482, s3, "#f77f00")}
       {badge(634, s4, "#06d6a0")}
-    </svg></body></html>'''
+    </svg></div>
+    <script>
+      function _fit(){{
+        var w = document.querySelector('.ahu-wrap');
+        if(!w) return;
+        var h = Math.ceil(w.getBoundingClientRect().height);
+        try{{ if(window.frameElement) window.frameElement.style.height = h + 'px'; }}catch(e){{}}
+        try{{ if(window.Streamlit) window.Streamlit.setFrameHeight(h); }}catch(e){{}}
+      }}
+      window.addEventListener('load', _fit);
+      window.addEventListener('resize', _fit);
+      new ResizeObserver(_fit).observe(document.querySelector('.ahu-wrap'));
+      setTimeout(_fit, 50); setTimeout(_fit, 300);
+    </script></body></html>'''
 
 
 # ==========================================================================
@@ -1126,17 +1141,14 @@ SCENARIOS = [
                        "away from the theoretical clean-plant line.",
     },
 ]
-SCENARIOS_BY_ID = {s["id"]: s for s in SCENARIOS}
+SCENARIOS_BY_ID = {s["id"]: s for s in SCENARIOS}   # (kept for reference/lookup)
 
 
 def apply_scenario(scn):
+    """Preset the sliders to the scenario's starting conditions (once per switch)."""
     for key, val in scn["controls"].items():
         st.session_state[key] = val
-    st.session_state["active_scenario"] = scn["id"]
-
-
-def clear_scenario():
-    st.session_state["active_scenario"] = None
+    st.session_state["applied_scenario"] = scn["id"]
 
 
 # ==========================================================================
@@ -1154,6 +1166,20 @@ with st.sidebar:
         help="Guided scenarios is the self-directed student mode. Instructor mode "
              "unlocks fault injection and quiz answer keys.")
     instructor = mode == "Instructor demonstration"
+
+    scenario = None
+    if mode == "Guided scenarios":
+        st.caption("Self-directed scenarios - pick one to set up the rig.")
+        _titles = [s["title"] for s in SCENARIOS]
+        _pick = st.selectbox("Scenario", _titles, key="scn_pick",
+                             label_visibility="collapsed")
+        scenario = SCENARIOS[_titles.index(_pick)]
+        # apply presets once, when the selection changes, so manual slider
+        # adjustments afterwards are not overwritten on every rerun
+        if st.session_state.get("applied_scenario") != scenario["id"]:
+            apply_scenario(scenario)
+    else:
+        st.session_state["applied_scenario"] = None
 
     st.divider()
     st.header("Data Source")
@@ -1248,9 +1274,7 @@ if live_mode:
         live_mode = False                        # graceful fallback to simulated
 
 if not live_mode:
-    active_scn = st.session_state.get("active_scenario")
-    scenario_faults = SCENARIOS_BY_ID[active_scn]["faults"] \
-        if active_scn in SCENARIOS_BY_ID else []
+    scenario_faults = scenario["faults"] if (mode == "Guided scenarios" and scenario) else []
     faults = list(dict.fromkeys(faults + scenario_faults))   # merge, dedupe
     controls = {
         "intake_dry_bulb_C": t_intake, "intake_RH_pct": rh_intake,
@@ -1380,7 +1404,7 @@ with tab1:
                 "same simulation core as the chart.")
 
     selected = st.selectbox("Select a component to inspect", COMPONENTS, index=2)
-    components.html(ahu_svg(sim, selected), height=560, scrolling=False)
+    components.html(ahu_svg(sim, selected), height=470, scrolling=True)
     st.info(component_detail(selected, sim))
     st.caption("Streamline animation rate scales with delivered airflow. Droplets appear "
                "only when the coil surface falls below the intake dew point. The coil "
@@ -1406,25 +1430,14 @@ with tab1:
                 st.markdown(txt)
     elif mode == "Guided scenarios":
         st.markdown("### Guided learning scenarios")
-        st.caption("Self-directed learning: pick a scenario, load it to set the rig to "
-                   "its starting condition, then work through the steps. Scenarios drive "
-                   "the simulated rig - set Data Source to Simulated for the intended "
-                   "experience.")
-        titles = [s["title"] for s in SCENARIOS]
-        pick = st.selectbox("Scenario", titles, key="scn_pick")
-        scn = SCENARIOS[titles.index(pick)]
-
-        b1, b2 = st.columns(2)
-        b1.button("Load scenario", on_click=apply_scenario, args=(scn,),
-                  use_container_width=True)
-        b2.button("Clear scenario", on_click=clear_scenario, use_container_width=True)
-        if st.session_state.get("active_scenario") == scn["id"]:
-            st.success("Scenario loaded - the rig is set to the starting conditions. "
-                       "Adjust the sliders as the steps direct.")
-        elif live_mode:
+        st.caption("Self-directed learning: choose a scenario from the sidebar and the "
+                   "rig is set to its starting condition automatically. Then work through "
+                   "the steps below, adjusting the sliders as directed.")
+        if live_mode:
             st.warning("You are in Live ingestion mode. Switch Data Source to "
                        "Simulated so the scenario's conditions drive the rig.")
-
+        scn = scenario
+        st.markdown(f"**Scenario.** {scn['title']}")
         st.markdown(f"**Situation.** {scn['situation']}")
         st.markdown(f"**Learning objective.** {scn['objective']}")
         st.markdown("**Steps**")
