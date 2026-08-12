@@ -548,7 +548,7 @@ def ahu_svg(sim, selected=None):
         'repeatCount="indefinite"/></path>')
 
     css = "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" \
-          "svg{display:block;width:100%;height:auto;}" \
+          "svg{display:block;width:100%;height:95vh;}" \
           'text{font-family:"Source Sans Pro",system-ui,sans-serif;}'
 
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><style>{css}</style></head>
@@ -1274,7 +1274,7 @@ with tab1:
                 "same simulation core as the chart.")
 
     selected = st.selectbox("Select a component to inspect", COMPONENTS, index=2)
-    components.html(ahu_svg(sim, selected), height=560, scrolling=False)
+    components.html(ahu_svg(sim, selected), height=650)
     st.info(component_detail(selected, sim))
     st.caption("Streamline animation rate scales with delivered airflow. Droplets appear "
                "only when the coil surface falls below the intake dew point. The coil "
