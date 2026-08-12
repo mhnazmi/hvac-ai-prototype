@@ -9,11 +9,16 @@ One simulation core (the AHU digital twin) feeding three work packages:
 
 All psychrometric properties are computed with PsychroLib, an implementation of
 the ASHRAE Handbook of Fundamentals (2017) formulations. No hand-rolled
-correlations are used anywhere in this file.
+correlations are used for any reported state property.
 """
 
 import os
+import io
+import csv
+import time
 import json
+import copy
+import datetime
 import streamlit as st
 import streamlit.components.v1 as components
 import plotly.graph_objects as go
@@ -30,7 +35,7 @@ st.set_page_config(page_title="AI HVAC Learning Platform", layout="wide")
 
 
 # ==========================================================================
-# SIMULATION CORE - the AHU digital twin
+# PSYCHROMETRIC STATE  (verified - unchanged)
 # ==========================================================================
 
 def state(t_db, w, label, tag=""):
@@ -38,9 +43,6 @@ def state(t_db, w, label, tag=""):
     humidity ratio. Every property below comes from PsychroLib / ASHRAE."""
     t_db = min(max(t_db, -50.0), 120.0)     # keep inside PsychroLib's domain
     w = max(w, 1e-6)
-    # Above ~100 C at 1 atm the saturation pressure exceeds atmospheric and the
-    # saturation humidity ratio goes negative, so the clamp is only meaningful
-    # below boiling.
     if t_db < 99.0:
         w_sat = psy.GetSatHumRatio(t_db, P_ATM)
         if w_sat > 0:
@@ -68,14 +70,12 @@ def simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults):
         ST-7/SH-4  after reheat         (sensible only)
         ST-9/SH-5  after humidifier     (latent only)
     """
-
-    # ---- fault effects on the physical plant -----------------------------
     bypass = 0.12                 # clean coil bypass factor
     approach = 1.5                # K, chilled water to coil surface
     flow_factor = 1.0
 
     if "Fouled cooling coil" in faults:
-        bypass = 0.38             # less contact area -> more air bypasses
+        bypass = 0.38
         approach = 4.5
     if "Clogged air filter" in faults:
         flow_factor *= 0.55
@@ -86,46 +86,40 @@ def simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults):
 
     airflow_actual = airflow * flow_factor
 
-    # ---- 1. intake -------------------------------------------------------
+    # 1. intake
     w_in = psy.GetHumRatioFromRelHum(t_intake, rh_intake / 100.0, P_ATM)
     s1 = state(t_intake, w_in, "Intake air", "ST-1 / SH-1")
 
-    # mass flow from actual (not standard) specific volume
     m_dot = (airflow_actual / 3600.0) / s1["v"]        # kg/s dry air basis
 
-    # ---- 2. cooling coil : apparatus dew point + bypass factor model -----
+    # 2. cooling coil : apparatus dew point + bypass factor model
     t_adp = t_chw + approach
     w_adp = psy.GetSatHumRatio(t_adp, P_ATM)
 
     t2 = t_adp + bypass * (s1["t_db"] - t_adp)
     if w_adp < s1["w"]:
-        # coil surface is below intake dew point -> condensation occurs
         w2 = w_adp + bypass * (s1["w"] - w_adp)
         dehumidifying = True
     else:
-        # dry coil, sensible cooling only
         w2 = s1["w"]
         dehumidifying = False
     t2 = min(t2, s1["t_db"])
     s2 = state(t2, w2, "After cooling coil", "ST-5 / SH-3")
 
-    # ---- 3. reheat : sensible heating, humidity ratio unchanged ----------
+    # 3. reheat : sensible heating, humidity ratio unchanged
     cp_moist = CP_AIR + CP_VAP * s2["w"]
     dt_reheat = reheat_kw / (m_dot * cp_moist) if m_dot > 1e-6 else 0.0
-    # Electric duct heaters carry a high-limit thermostat. If airflow is too low
-    # for the selected duty the element would glow and the cutout opens, so we
-    # cap the leaving air temperature rather than letting dT run away.
     t_reheat = s2["t_db"] + dt_reheat
     heater_tripped = t_reheat > T_HIGH_LIMIT
     if heater_tripped:
         t_reheat = T_HIGH_LIMIT
     s3 = state(t_reheat, s2["w"], "After reheat", "ST-7 / SH-4")
 
-    # ---- 4. humidifier : moisture added, dry bulb ~unchanged -------------
+    # 4. humidifier : moisture added, dry bulb ~unchanged
     dw = (humid_kgh / 3600.0) / m_dot if m_dot > 1e-6 else 0.0
     s4 = state(s3["t_db"], s3["w"] + dw, "Supply to chamber", "ST-9 / SH-5")
 
-    # ---- coil load breakdown --------------------------------------------
+    # coil load breakdown
     q_total = m_dot * (s1["h"] - s2["h"])
     q_sens = m_dot * cp_moist * (s1["t_db"] - s2["t_db"])
     q_lat = q_total - q_sens
@@ -138,6 +132,7 @@ def simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults):
         "airflow_actual": airflow_actual,
         "t_adp": t_adp,
         "bypass": bypass,
+        "approach": approach,
         "q_total": q_total,
         "q_sens": q_sens,
         "q_lat": q_lat,
@@ -150,9 +145,12 @@ def simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults):
     }
 
 
+# ==========================================================================
+# PLANT DIAGNOSTICS  (verified - unchanged)
+# ==========================================================================
+
 def diagnose(sim, airflow_setpoint):
-    """Compare the twin against expected behaviour and raise findings.
-    This is what makes WP3's 'detect abnormal conditions' concrete."""
+    """Compare the twin against expected behaviour and raise findings."""
     findings = []
     s1, s2 = sim["states"][0], sim["states"][1]
 
@@ -216,14 +214,142 @@ def diagnose(sim, airflow_setpoint):
 
 
 # ==========================================================================
-# WP3 - PSYCHROMETRIC CHART
+# SENSOR-FAULT INJECTION + DETECTION  (WP3: "potential sensor faults")
+# ==========================================================================
+# Plant faults degrade the physics. Sensor faults corrupt only the *reported*
+# reading while the true physics is unchanged, so they are caught by physical
+# consistency checks rather than by the value being "high" or "low".
+
+SENSOR_FAULTS = {
+    "SH-4 humidity sensor drift": "reheat_w",
+    "ST-5 coil-outlet temp bias": "coil_t",
+    "SH-3 coil-outlet RH stuck high": "coil_rh",
+}
+
+
+def apply_sensor_faults(sim, sensor_faults):
+    """Return a copy of the reported state points with the selected sensor
+    faults injected, plus a per-point map of which readings are corrupted."""
+    import copy
+    reported = copy.deepcopy(sim["states"])
+    corrupted = {i: [] for i in range(len(reported))}
+
+    if "SH-4 humidity sensor drift" in sensor_faults:
+        # Reheat is sensible-only, so W at pt 3 must equal W at pt 2. A drifting
+        # humidity sensor reports a different value - physically impossible.
+        reported[2]["w"] = reported[2]["w"] + 0.0022
+        reported[2]["rh"] = psy.GetRelHumFromHumRatio(
+            reported[2]["t_db"], reported[2]["w"], P_ATM) * 100.0
+        corrupted[2].append("w")
+
+    if "ST-5 coil-outlet temp bias" in sensor_faults:
+        # Reports the coil outlet colder than the apparatus dew point, which no
+        # real coil can achieve (air cannot leave colder than the ADP).
+        reported[1]["t_db"] = sim["t_adp"] - 2.5
+        corrupted[1].append("t_db")
+
+    if "SH-3 coil-outlet RH stuck high" in sensor_faults:
+        reported[1]["rh"] = 101.5     # impossible: RH cannot exceed 100%
+        corrupted[1].append("rh")
+
+    return reported, corrupted
+
+
+def diagnose_sensors(sim, reported):
+    """Detect sensor faults from physical inconsistency, not magnitude."""
+    findings = []
+    s2_true, s3_true = sim["states"][1], sim["states"][2]
+    r2, r3 = reported[1], reported[2]
+
+    # RH can never physically exceed saturation
+    for i, r in enumerate(reported):
+        if r["rh"] > 100.5:
+            findings.append((
+                "error", f"Sensor fault: {r['tag']}",
+                f"Reported RH is {r['rh']:.0f}% at point {i+1}. Relative humidity "
+                "cannot exceed 100%; the humidity sensor is reading out of range."))
+
+    # Reheat conserves humidity ratio (sensible only)
+    if abs(r3["w"] - r2["w"]) > 0.0005 and abs(s3_true["w"] - s2_true["w"]) < 1e-9:
+        findings.append((
+            "error", "Sensor fault: SH-4 humidity sensor",
+            f"Reported humidity ratio rises {(r3['w']-r2['w'])*1000:.2f} g/kg across "
+            "the reheater, but reheat adds sensible heat only and cannot change "
+            "moisture content. The SH-4 humidity sensor has drifted."))
+
+    # Air cannot leave the coil colder than the apparatus dew point
+    if r2["t_db"] < sim["t_adp"] - 0.3:
+        findings.append((
+            "error", "Sensor fault: ST-5 temperature sensor",
+            f"Reported coil-outlet temperature is {r2['t_db']:.1f} deg C, below the "
+            f"apparatus dew point of {sim['t_adp']:.1f} deg C. Air cannot leave the "
+            "coil colder than the ADP, so ST-5 is reading with a negative bias."))
+
+    if not findings:
+        findings.append((
+            "ok", "Sensor integrity nominal",
+            "All reported readings are physically consistent with the psychrometric "
+            "process. No sensor drift, bias or out-of-range values detected."))
+    return findings
+
+
+# ==========================================================================
+# DECISION SUPPORT / OPTIMISATION HINTS  (WP3: operation & optimisation)
 # ==========================================================================
 
-def psych_chart(sim, show_process=True):
-    fig = go.Figure()
-    t_range = [t * 0.5 for t in range(int(0 / 0.5), int(50 / 0.5) + 1)]
+def recommend(sim, controls):
+    """Rule-based setpoint advice. Each hint names an action and its effect."""
+    hints = []
+    s1, s2, s3, s4 = sim["states"]
 
-    # constant-RH curves, saturation last so it draws on top
+    if "Fouled cooling coil" in sim["faults"]:
+        recoverable = sim["q_total"] * (0.38 - 0.12) / 0.38
+        hints.append(("high",
+            f"Clean the cooling coil. Restoring the bypass factor from "
+            f"{sim['bypass']:.2f} to 0.12 recovers roughly {recoverable:.1f} kW of "
+            "coil capacity and sharpens the approach temperature."))
+
+    if sim["airflow_actual"] < controls["airflow_setpoint"] * 0.85:
+        hints.append(("high",
+            f"Restore airflow. Delivered flow ({sim['airflow_actual']:.0f} m3/h) is "
+            f"well below the {controls['airflow_setpoint']:.0f} m3/h setpoint; clear "
+            "the filter or retension the fan belt before trusting coil performance."))
+
+    if not sim["dehumidifying"] and s1["t_dp"] > 8:
+        drop = sim["t_adp"] - s1["t_dp"]
+        hints.append(("med",
+            f"To begin dehumidification, lower the chilled-water temperature by about "
+            f"{drop + 1:.0f} deg C so the apparatus dew point drops below the intake "
+            f"dew point of {s1['t_dp']:.1f} deg C."))
+
+    if controls["reheat_kW"] > 0.1 and sim["shr"] < 0.7 and s2["t_db"] < 14:
+        hints.append(("med",
+            "You are overcooling then reheating. Raising the chilled-water temperature "
+            "slightly cuts the coil load and the reheat needed to correct it - the "
+            "same supply condition for less total energy."))
+
+    if sim["heater_tripped"]:
+        hints.append(("high",
+            f"Reheat is on its high-limit cutout. Raise airflow above "
+            f"{sim['airflow_actual']:.0f} m3/h or cut the reheat duty so the leaving "
+            f"air stays under {T_HIGH_LIMIT:.0f} deg C."))
+
+    if not hints:
+        hints.append(("ok",
+            "Operating point is efficient for the current targets. Coil load "
+            f"{sim['q_total']:.1f} kW at SHR {sim['shr']:.2f}, no wasted reheat, "
+            "airflow at setpoint."))
+    return hints
+
+
+# ==========================================================================
+# PSYCHROMETRIC CHART  (WP3) - now overlays theoretical vs actual
+# ==========================================================================
+
+def psych_chart(sim, sim_ideal=None, selected_pt=None):
+    fig = go.Figure()
+    t_range = [t * 0.5 for t in range(0, int(50 / 0.5) + 1)]
+
     for rh in [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]:
         ws = [psy.GetHumRatioFromRelHum(t, rh / 100.0, P_ATM) * 1000 for t in t_range]
         sat = rh == 100
@@ -231,9 +357,7 @@ def psych_chart(sim, show_process=True):
             x=t_range, y=ws, mode="lines", showlegend=False, hoverinfo="skip",
             line=dict(color="#4a90d9" if sat else "#7f8c9a",
                       width=2.5 if sat else 0.8,
-                      dash="solid" if sat else "dot"),
-            name=f"{rh}% RH",
-        ))
+                      dash="solid" if sat else "dot")))
         if rh in (20, 40, 60, 80, 100):
             idx = min(range(len(t_range)), key=lambda i: abs(ws[i] - 27))
             if ws[idx] < 27 and t_range[idx] < 49:
@@ -241,7 +365,6 @@ def psych_chart(sim, show_process=True):
                                    showarrow=False, font=dict(size=9, color="#7f8c9a"),
                                    xshift=14, yshift=6)
 
-    # constant-enthalpy lines
     for h_val in range(20, 121, 20):
         xs, ys = [], []
         for t in t_range:
@@ -254,101 +377,191 @@ def psych_chart(sim, show_process=True):
                                      hoverinfo="skip",
                                      line=dict(color="#6b5b8a", width=0.6, dash="dash")))
 
-    # process line through the four state points
-    if show_process:
-        pts = sim["states"]
+    # theoretical (clean-plant) process - dashed grey-green, drawn first
+    if sim_ideal is not None:
+        ip = sim_ideal["states"]
         fig.add_trace(go.Scatter(
-            x=[p["t_db"] for p in pts], y=[p["w"] * 1000 for p in pts],
-            mode="lines", line=dict(color="#ff4b4b", width=3),
-            name="Process path", hoverinfo="skip",
-        ))
-        colors = ["#ffd166", "#4cc9f0", "#f77f00", "#06d6a0"]
-        for i, p in enumerate(pts):
-            fig.add_trace(go.Scatter(
-                x=[p["t_db"]], y=[p["w"] * 1000], mode="markers+text",
-                marker=dict(size=15, color=colors[i],
-                            line=dict(color="white", width=1.5)),
-                text=[str(i + 1)], textposition="middle center",
-                textfont=dict(size=10, color="#111"),
-                name=f"{i+1}. {p['label']}",
-                hovertemplate=(
-                    f"<b>{p['label']}</b> ({p['tag']})<br>"
-                    f"Dry bulb: {p['t_db']:.1f} deg C<br>"
-                    f"Humidity ratio: {p['w']*1000:.2f} g/kg<br>"
-                    f"RH: {p['rh']:.1f} %<br>"
-                    f"Enthalpy: {p['h']:.2f} kJ/kg<br>"
-                    f"Dew point: {p['t_dp']:.1f} deg C<br>"
-                    f"Wet bulb: {p['t_wb']:.1f} deg C<extra></extra>"),
-            ))
-        # apparatus dew point marker
+            x=[p["t_db"] for p in ip], y=[p["w"] * 1000 for p in ip],
+            mode="lines+markers", line=dict(color="#06d6a0", width=2, dash="dash"),
+            marker=dict(size=9, color="#06d6a0", symbol="circle-open",
+                        line=dict(width=1.5)),
+            name="Theoretical (clean plant)",
+            hovertemplate="Theoretical<br>%{x:.1f} C, %{y:.2f} g/kg<extra></extra>"))
+
+    # actual (measured) process line
+    pts = sim["states"]
+    fig.add_trace(go.Scatter(
+        x=[p["t_db"] for p in pts], y=[p["w"] * 1000 for p in pts],
+        mode="lines", line=dict(color="#ff4b4b", width=3),
+        name="Actual (measured)", hoverinfo="skip"))
+    colors = ["#ffd166", "#4cc9f0", "#f77f00", "#06d6a0"]
+    for i, p in enumerate(pts):
+        big = (selected_pt == i)
         fig.add_trace(go.Scatter(
-            x=[sim["t_adp"]], y=[psy.GetSatHumRatio(sim["t_adp"], P_ATM) * 1000],
-            mode="markers", marker=dict(size=11, color="#ff4b4b", symbol="x-thin",
-                                        line=dict(width=2.5, color="#ff4b4b")),
-            name="Apparatus dew point", hoverinfo="skip",
-        ))
+            x=[p["t_db"]], y=[p["w"] * 1000], mode="markers+text",
+            marker=dict(size=22 if big else 15, color=colors[i],
+                        line=dict(color="#111" if big else "white",
+                                  width=3 if big else 1.5)),
+            text=[str(i + 1)], textposition="middle center",
+            textfont=dict(size=11, color="#111"),
+            name=f"{i+1}. {p['label']}",
+            hovertemplate=(
+                f"<b>{p['label']}</b> ({p['tag']})<br>"
+                f"Dry bulb: {p['t_db']:.1f} deg C<br>"
+                f"Humidity ratio: {p['w']*1000:.2f} g/kg<br>"
+                f"RH: {p['rh']:.1f} %<br>"
+                f"Enthalpy: {p['h']:.2f} kJ/kg<br>"
+                f"Dew point: {p['t_dp']:.1f} deg C<br>"
+                f"Wet bulb: {p['t_wb']:.1f} deg C<extra></extra>")))
+
+    fig.add_trace(go.Scatter(
+        x=[sim["t_adp"]], y=[psy.GetSatHumRatio(sim["t_adp"], P_ATM) * 1000],
+        mode="markers", marker=dict(size=11, color="#ff4b4b", symbol="x-thin",
+                                    line=dict(width=2.5, color="#ff4b4b")),
+        name="Apparatus dew point", hoverinfo="skip"))
 
     fig.update_layout(
         xaxis=dict(title="Dry Bulb Temperature (deg C)", range=[0, 50],
                    gridcolor="rgba(128,128,128,0.15)", dtick=5),
         yaxis=dict(title="Humidity Ratio (g water / kg dry air)", range=[0, 27],
                    side="right", gridcolor="rgba(128,128,128,0.15)", dtick=5),
-        height=430, margin=dict(l=10, r=60, t=30, b=10),
+        height=460, margin=dict(l=10, r=60, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0, font=dict(size=10)),
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-    )
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
     return fig
 
 
 # ==========================================================================
-# WP1 - IMMERSIVE SCHEMATIC
+# INTERACTIVE AHU SCHEMATIC  (WP1) - CHW loop, refrigerant, component highlight
 # ==========================================================================
 
-def ahu_svg(sim):
+COMPONENTS = ["Intake", "Blower", "Cooling coil", "Reheater",
+              "Humidifier", "Test chamber", "Chilled-water loop", "Chiller"]
+
+
+def component_detail(name, sim):
+    """Live, per-component explanation shown when a component is selected."""
     s1, s2, s3, s4 = sim["states"]
+    if name == "Intake":
+        return (f"**Intake (ST-1 / SH-1)** - {s1['t_db']:.1f} deg C, {s1['rh']:.0f}% RH, "
+                f"dew point {s1['t_dp']:.1f} deg C. This fixes the moisture the coil must "
+                "remove: the coil can only dehumidify if its surface falls below this "
+                "dew point.")
+    if name == "Blower":
+        return (f"**Blower (AVE-1)** - delivering {sim['airflow_actual']:.0f} m3/h, giving "
+                f"a dry-air mass flow of {sim['m_dot']:.3f} kg/s. Every load in the unit "
+                "scales with this mass flow, so a filter or belt fault here weakens the "
+                "coil, reheat and humidifier at once.")
+    if name == "Cooling coil":
+        return (f"**Cooling coil** - apparatus dew point {sim['t_adp']:.1f} deg C, bypass "
+                f"factor {sim['bypass']:.2f}. Air leaves at {s2['t_db']:.1f} deg C, "
+                f"{s2['rh']:.0f}% RH. "
+                + (f"Currently dehumidifying at {sim['condensate']:.2f} kg/h condensate."
+                   if sim["dehumidifying"] else
+                   "Currently running dry - the surface is above the intake dew point, "
+                   "so it cools sensibly only."))
+    if name == "Reheater":
+        return (f"**Electric reheater (AR-1)** - raises dry bulb from {s2['t_db']:.1f} to "
+                f"{s3['t_db']:.1f} deg C at constant humidity ratio. On the chart this is a "
+                "purely horizontal move to the right; RH falls as the air warms.")
+    if name == "Humidifier":
+        return (f"**Steam humidifier (AHUM-1)** - lifts humidity ratio from "
+                f"{s3['w']*1000:.2f} to {s4['w']*1000:.2f} g/kg at nearly constant dry "
+                "bulb, a near-vertical rise on the chart.")
+    if name == "Test chamber":
+        return (f"**Test chamber** - receives supply air at {s4['t_db']:.1f} deg C, "
+                f"{s4['rh']:.0f}% RH ({s4['h']:.1f} kJ/kg). This is the conditioned space "
+                "the whole process exists to serve.")
+    if name == "Chilled-water loop":
+        return (f"**Chilled-water loop (AB-1 pump, tank ST-15)** - carries heat from the "
+                f"coil to the chiller. Supply around {sim['t_adp']-sim['approach']:.1f} deg C; "
+                f"a {sim['approach']:.1f} K approach sets the coil surface temperature. "
+                "Low flow here widens the approach and weakens dehumidification.")
+    if name == "Chiller":
+        return (f"**Chiller (A-ENF)** - a vapour-compression unit rejecting the "
+                f"{sim['q_total']:.1f} kW the coil absorbs. Evaporator chills the water; "
+                "compressor, condenser and expansion valve complete the refrigerant cycle.")
+    return ""
+
+
+def ahu_svg(sim, selected=None):
+    s1, s2, s3, s4 = sim["states"]
+
+    def glow(x, y, w, h):
+        return (f'<rect x="{x-4}" y="{y-4}" width="{w+8}" height="{h+8}" rx="6" '
+                f'fill="none" stroke="#ffd166" stroke-width="3" opacity="0.9"/>')
+
+    sel = selected or ""
+    hl_blower = glow(86, 104, 52, 52) if sel == "Blower" else ""
+    hl_coil = glow(228, 98, 62, 64) if sel == "Cooling coil" else ""
+    hl_reheat = glow(410, 98, 62, 64) if sel == "Reheater" else ""
+    hl_humid = glow(580, 98, 62, 64) if sel == "Humidifier" else ""
+    hl_chamber = glow(748, 72, 76, 116) if sel == "Test chamber" else ""
+    hl_intake = glow(40, 95, 30, 70) if sel == "Intake" else ""
+    hl_chw = (glow(250, 228, 432, 74) if sel == "Chilled-water loop" else "")
+    hl_chiller = glow(690, 210, 120, 108) if sel == "Chiller" else ""
+
     drip = ""
     if sim["condensate"] > 0.01:
         for i, dx in enumerate([0, 9, 18]):
             drip += (
-                f'<circle cx="{243+dx}" cy="150" r="2.6" fill="#4cc9f0">'
-                f'<animate attributeName="cy" values="150;196" dur="1.5s" '
+                f'<circle cx="{243+dx}" cy="164" r="2.6" fill="#4cc9f0">'
+                f'<animate attributeName="cy" values="164;206" dur="1.5s" '
                 f'begin="{i*0.5}s" repeatCount="indefinite"/>'
                 f'<animate attributeName="opacity" values="1;1;0" dur="1.5s" '
                 f'begin="{i*0.5}s" repeatCount="indefinite"/></circle>')
 
     speed = max(0.6, 3.0 * (500.0 / max(sim["airflow_actual"], 60)))
-
-    def badge(x, s, color):
-        return f'''
-        <rect x="{x}" y="34" width="104" height="46" rx="5"
-              fill="rgba(20,24,32,0.92)" stroke="{color}" stroke-width="1.4"/>
-        <text x="{x+52}" y="49" font-size="9" fill="{color}"
-              text-anchor="middle" font-family="monospace">{s["tag"]}</text>
-        <text x="{x+52}" y="63" font-size="12" fill="#fff" text-anchor="middle"
-              font-family="monospace" font-weight="bold">{s["t_db"]:.1f} C</text>
-        <text x="{x+52}" y="75" font-size="10" fill="#9fb0c0" text-anchor="middle"
-              font-family="monospace">{s["rh"]:.0f}% RH</text>'''
-
     coil_color = "#e63946" if sim["bypass"] > 0.25 else "#4cc9f0"
 
-    return f'''<!DOCTYPE html><html><head><meta charset="utf-8">
-    <style>
-      html,body {{ margin:0; padding:0; background:transparent; overflow:hidden; }}
-      svg {{ display:block; width:100%; height:auto; }}
-      text {{ font-family: "Source Sans Pro", system-ui, sans-serif; }}
-    </style></head><body>
-    <svg viewBox="0 0 860 260" preserveAspectRatio="xMidYMid meet"
-         xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="2.4"
-                orient="auto"><path d="M0,0 L0,4.8 L6,2.4 z" fill="#6ee7ff"/></marker>
-      </defs>
+    def badge(x, s, color):
+        return (
+            f'<rect x="{x}" y="34" width="104" height="46" rx="5" '
+            f'fill="rgba(20,24,32,0.92)" stroke="{color}" stroke-width="1.4"/>'
+            f'<text x="{x+52}" y="49" font-size="9" fill="{color}" '
+            f'text-anchor="middle" font-family="monospace">{s["tag"]}</text>'
+            f'<text x="{x+52}" y="63" font-size="12" fill="#fff" text-anchor="middle" '
+            f'font-family="monospace" font-weight="bold">{s["t_db"]:.1f} C</text>'
+            f'<text x="{x+52}" y="75" font-size="10" fill="#9fb0c0" text-anchor="middle" '
+            f'font-family="monospace">{s["rh"]:.0f}% RH</text>')
 
-      <!-- duct -->
+    coil_bars = "".join(
+        f'<line x1="{234+i*9}" y1="102" x2="{234+i*9}" y2="158" '
+        f'stroke="{coil_color}" stroke-width="1.6" opacity="0.65"/>' for i in range(7))
+    heat_bars = "".join(
+        f'<line x1="416" y1="{106+i*13}" x2="466" y2="{106+i*13}" '
+        f'stroke="#e63946" stroke-width="2" opacity="0.75"/>' for i in range(5))
+    steam = "".join(
+        f'<circle cx="{594+i*16}" cy="{118+(i%2)*22}" r="4" fill="#06d6a0" opacity="0.7">'
+        f'<animate attributeName="r" values="2;6;2" dur="2s" begin="{i*0.4}s" '
+        f'repeatCount="indefinite"/></circle>' for i in range(3))
+
+    # chilled-water pipes: coil -> chiller and back, animated flow
+    chw_flow = (
+        '<path d="M259,162 V240 H700" stroke="#4cc9f0" stroke-width="3" fill="none" '
+        'stroke-dasharray="10 8" opacity="0.85">'
+        f'<animate attributeName="stroke-dashoffset" values="36;0" dur="1.4s" '
+        'repeatCount="indefinite"/></path>'
+        '<path d="M760,240 V286 H320 V232" stroke="#2a9d8f" stroke-width="3" fill="none" '
+        'stroke-dasharray="10 8" opacity="0.7">'
+        f'<animate attributeName="stroke-dashoffset" values="0;36" dur="1.6s" '
+        'repeatCount="indefinite"/></path>')
+
+    css = "html,body{margin:0;padding:0;background:transparent;overflow:hidden;}" \
+          "svg{display:block;width:100%;height:auto;}" \
+          'text{font-family:"Source Sans Pro",system-ui,sans-serif;}'
+
+    return f'''<!DOCTYPE html><html><head><meta charset="utf-8"><style>{css}</style></head>
+    <body><svg viewBox="0 0 860 330" preserveAspectRatio="xMidYMid meet"
+         xmlns="http://www.w3.org/2000/svg">
+      <defs><marker id="ar" markerWidth="7" markerHeight="7" refX="6" refY="2.4"
+        orient="auto"><path d="M0,0 L0,4.8 L6,2.4 z" fill="#6ee7ff"/></marker></defs>
+
+      {hl_intake}{hl_blower}{hl_coil}{hl_reheat}{hl_humid}{hl_chamber}{hl_chw}{hl_chiller}
+
       <rect x="40" y="95" width="700" height="70" rx="4" fill="rgba(255,255,255,0.03)"
             stroke="#4a5568" stroke-width="1.6"/>
 
-      <!-- airflow streamlines -->
       <path d="M55,115 H735" stroke="#6ee7ff" stroke-width="1.6" fill="none"
             stroke-dasharray="14 10" marker-end="url(#ar)" opacity="0.75">
         <animate attributeName="stroke-dashoffset" values="48;0"
@@ -358,60 +571,143 @@ def ahu_svg(sim):
         <animate attributeName="stroke-dashoffset" values="48;0"
                  dur="{speed*1.25:.2f}s" repeatCount="indefinite"/></path>
 
-      <!-- blower -->
       <circle cx="112" cy="130" r="26" fill="rgba(110,231,255,0.08)"
               stroke="#6ee7ff" stroke-width="1.6"/>
-      <g>
-        <path d="M112,112 L118,130 L112,148 L106,130 Z" fill="#6ee7ff" opacity="0.9"/>
+      <g><path d="M112,112 L118,130 L112,148 L106,130 Z" fill="#6ee7ff" opacity="0.9"/>
         <path d="M94,130 L112,124 L130,130 L112,136 Z" fill="#6ee7ff" opacity="0.6"/>
         <circle cx="112" cy="130" r="4" fill="#6ee7ff"/>
         <animateTransform attributeName="transform" type="rotate"
-                          from="0 112 130" to="360 112 130"
-                          dur="{speed*0.35:.2f}s" repeatCount="indefinite"
-                          additive="sum"/>
-      </g>
-      <text x="112" y="184" font-size="10" fill="#9fb0c0" text-anchor="middle">BLOWER AVE-1</text>
-      <text x="112" y="196" font-size="9" fill="#6ee7ff" text-anchor="middle"
+          from="0 112 130" to="360 112 130" dur="{speed*0.35:.2f}s"
+          repeatCount="indefinite" additive="sum"/></g>
+      <text x="112" y="186" font-size="10" fill="#9fb0c0" text-anchor="middle">BLOWER AVE-1</text>
+      <text x="112" y="198" font-size="9" fill="#6ee7ff" text-anchor="middle"
             font-family="monospace">{sim["airflow_actual"]:.0f} m3/h</text>
 
-      <!-- cooling coil -->
       <rect x="228" y="98" width="62" height="64" rx="3" fill="rgba(76,201,240,0.14)"
             stroke="{coil_color}" stroke-width="2"/>
-      {''.join(f'<line x1="{234+i*9}" y1="102" x2="{234+i*9}" y2="158" stroke="{coil_color}" stroke-width="1.6" opacity="0.65"/>' for i in range(7))}
-      <text x="259" y="184" font-size="10" fill="#9fb0c0" text-anchor="middle">COOLING COIL</text>
-      <text x="259" y="196" font-size="9" fill="{coil_color}" text-anchor="middle"
+      {coil_bars}
+      <text x="259" y="186" font-size="10" fill="#9fb0c0" text-anchor="middle">COOLING COIL</text>
+      <text x="259" y="198" font-size="9" fill="{coil_color}" text-anchor="middle"
             font-family="monospace">ADP {sim["t_adp"]:.1f} C</text>
       {drip}
-      <text x="259" y="216" font-size="9" fill="#4cc9f0" text-anchor="middle"
+      <text x="259" y="222" font-size="9" fill="#4cc9f0" text-anchor="middle"
             font-family="monospace">{sim["condensate"]:.2f} kg/h condensate</text>
 
-      <!-- reheat -->
       <rect x="410" y="98" width="62" height="64" rx="3" fill="rgba(230,57,70,0.14)"
             stroke="#e63946" stroke-width="2"/>
-      {''.join(f'<line x1="416" y1="{106+i*13}" x2="466" y2="{106+i*13}" stroke="#e63946" stroke-width="2" opacity="0.75"/>' for i in range(5))}
-      <text x="441" y="184" font-size="10" fill="#9fb0c0" text-anchor="middle">HEATER AR-1</text>
+      {heat_bars}
+      <text x="441" y="186" font-size="10" fill="#9fb0c0" text-anchor="middle">HEATER AR-1</text>
 
-      <!-- humidifier -->
       <rect x="580" y="98" width="62" height="64" rx="3" fill="rgba(6,214,160,0.14)"
             stroke="#06d6a0" stroke-width="2"/>
-      {''.join(f'<circle cx="{594+i*16}" cy="{118+(i%2)*22}" r="4" fill="#06d6a0" opacity="0.7"><animate attributeName="r" values="2;6;2" dur="2s" begin="{i*0.4}s" repeatCount="indefinite"/></circle>' for i in range(3))}
-      <text x="611" y="184" font-size="10" fill="#9fb0c0" text-anchor="middle">HUMIDIFIER AHUM-1</text>
+      {steam}
+      <text x="611" y="186" font-size="10" fill="#9fb0c0" text-anchor="middle">HUMIDIFIER AHUM-1</text>
 
-      <!-- chamber -->
       <rect x="748" y="72" width="76" height="116" rx="4" fill="rgba(255,255,255,0.04)"
             stroke="#4a5568" stroke-width="1.6"/>
-      <text x="786" y="134" font-size="10" fill="#9fb0c0" text-anchor="middle">TEST</text>
-      <text x="786" y="147" font-size="10" fill="#9fb0c0" text-anchor="middle">CHAMBER</text>
+      <text x="786" y="128" font-size="10" fill="#9fb0c0" text-anchor="middle">TEST</text>
+      <text x="786" y="141" font-size="10" fill="#9fb0c0" text-anchor="middle">CHAMBER</text>
+
+      <!-- chilled water circuit -->
+      {chw_flow}
+      <circle cx="320" cy="240" r="10" fill="rgba(76,201,240,0.15)" stroke="#4cc9f0"
+              stroke-width="1.6"/>
+      <path d="M315,240 L325,235 L325,245 Z" fill="#4cc9f0"/>
+      <text x="320" y="266" font-size="8.5" fill="#9fb0c0" text-anchor="middle">CHW PUMP AB-1</text>
+      <rect x="470" y="272" width="70" height="26" rx="3" fill="rgba(76,201,240,0.10)"
+            stroke="#4cc9f0" stroke-width="1.3"/>
+      <text x="505" y="288" font-size="8.5" fill="#9fb0c0" text-anchor="middle">CHW TANK ST-15</text>
+
+      <!-- chiller: vapour-compression cycle -->
+      <rect x="690" y="210" width="120" height="108" rx="5" fill="rgba(255,255,255,0.03)"
+            stroke="#4a5568" stroke-width="1.6"/>
+      <text x="750" y="223" font-size="8.5" fill="#c3cede" text-anchor="middle"
+            font-weight="bold">CHILLER A-ENF</text>
+      <text x="750" y="233" font-size="7.5" fill="#7f8c9a" text-anchor="middle">vapour compression</text>
+      <circle cx="712" cy="256" r="8" fill="none" stroke="#f77f00" stroke-width="1.6"/>
+      <text x="712" y="275" font-size="7" fill="#f77f00" text-anchor="middle">COMP</text>
+      <rect x="736" y="248" width="20" height="16" fill="none" stroke="#e63946" stroke-width="1.4"/>
+      <text x="746" y="275" font-size="7" fill="#e63946" text-anchor="middle">COND</text>
+      <path d="M772,248 l6,8 l-6,8 l6,0" fill="none" stroke="#4cc9f0" stroke-width="1.4"/>
+      <text x="784" y="275" font-size="7" fill="#4cc9f0" text-anchor="middle">EXP</text>
+      <rect x="736" y="289" width="20" height="14" fill="none" stroke="#06d6a0" stroke-width="1.4"/>
+      <text x="746" y="299" font-size="6.5" fill="#06d6a0" text-anchor="middle">EVAP</text>
+      <path d="M720,256 H736 M756,256 H772 M782,272 V296 H756 M736,296 H720 V264"
+            stroke="#6b7280" stroke-width="1.2" fill="none"/>
+      <text x="750" y="313" font-size="8" fill="#9fb0c0" text-anchor="middle">rejects {sim["q_total"]:.1f} kW</text>
 
       {badge(46, s1, "#ffd166")}
       {badge(300, s2, "#4cc9f0")}
       {badge(482, s3, "#f77f00")}
-      {badge(652, s4, "#06d6a0")}
+      {badge(634, s4, "#06d6a0")}
     </svg></body></html>'''
 
 
 # ==========================================================================
-# WP2 - AI LEARNING ASSISTANT
+# QUIZ  (WP1: student quiz with export)
+# ==========================================================================
+
+def build_quiz(sim):
+    """Mix of concept questions and questions generated from the live state."""
+    s1, s2 = sim["states"][0], sim["states"][1]
+    quiz = [
+        {"id": "q1", "type": "bool",
+         "q": "Right now, is the cooling coil dehumidifying the air (removing moisture)?",
+         "options": ["Yes", "No"],
+         "answer": "Yes" if sim["dehumidifying"] else "No",
+         "why": ("The coil dehumidifies only when its surface (the apparatus dew point) "
+                 "is below the intake dew point.")},
+        {"id": "q2", "type": "num",
+         "q": "Read the current sensible heat ratio (SHR) from the coil analysis. "
+              "Enter it to 2 decimals (accepted within +/-0.03).",
+         "answer": round(sim["shr"], 2), "tol": 0.03,
+         "why": "SHR = sensible load / total load."},
+        {"id": "q3", "type": "mc",
+         "q": "The electric reheater adds which kind of heat?",
+         "options": ["Sensible only", "Latent only", "Both sensible and latent"],
+         "answer": "Sensible only",
+         "why": "Reheat raises dry bulb at constant humidity ratio - a horizontal "
+                "move on the psychrometric chart."},
+        {"id": "q4", "type": "mc",
+         "q": "Steam humidification at constant dry bulb moves the state point which way "
+              "on the psychrometric chart?",
+         "options": ["Up (higher humidity ratio)", "Right (higher temperature)",
+                     "Down (lower humidity ratio)"],
+         "answer": "Up (higher humidity ratio)",
+         "why": "Adding moisture at constant temperature raises the humidity ratio, "
+                "a near-vertical rise."},
+        {"id": "q5", "type": "mc",
+         "q": "If the coil is running dry, which single change would start "
+              "dehumidification?",
+         "options": ["Lower the chilled-water temperature", "Increase the reheat duty",
+                     "Increase the airflow setpoint"],
+         "answer": "Lower the chilled-water temperature",
+         "why": "Lowering chilled water drops the apparatus dew point below the intake "
+                "dew point, so moisture begins to condense."},
+    ]
+    return quiz
+
+
+def grade_quiz(quiz, responses):
+    score, results = 0, []
+    for item in quiz:
+        given = responses.get(item["id"])
+        if item["type"] == "num":
+            try:
+                ok = given is not None and abs(float(given) - item["answer"]) <= item["tol"]
+            except (TypeError, ValueError):
+                ok = False
+        else:
+            ok = (given == item["answer"])
+        score += int(ok)
+        results.append({"id": item["id"], "question": item["q"],
+                        "your_answer": given, "correct_answer": item["answer"],
+                        "correct": ok, "explanation": item["why"]})
+    return score, results
+
+
+# ==========================================================================
+# WP2 - AI LEARNING ASSISTANT  (verified - unchanged)
 # ==========================================================================
 
 SYSTEM_PROMPT = """You are the AI Lab Assistant for a Singapore Institute of \
@@ -474,8 +770,6 @@ def get_api_key():
 
 
 def extract_text(resp):
-    """Pull the visible answer out of a response. resp.text can be None when the
-    model spent its budget on thinking, so fall back to walking the parts."""
     try:
         if getattr(resp, "text", None):
             return resp.text.strip()
@@ -493,15 +787,8 @@ def extract_text(resp):
 
 
 def resolve_model():
-    """Ask the API which models this key can actually use.
-
-    Model IDs churn (Gemini 2.0 Flash was retired on 1 June 2026), so hard-coding
-    one is fragile. We list what the key can reach, keep the text models that
-    support generateContent, and prefer Flash tiers by generation.
-    """
     if "model_id" in st.session_state:
         return st.session_state.model_id
-
     key = get_api_key()
     if not key:
         return None
@@ -512,9 +799,7 @@ def resolve_model():
             m.name.replace("models/", "")
             for m in client.models.list()
             if "generateContent" in getattr(m, "supported_actions", []) or
-               "generateContent" in getattr(m, "supported_generation_methods", [])
-        ]
-        # exclude non-text variants that would fail on a plain text prompt
+               "generateContent" in getattr(m, "supported_generation_methods", [])]
         usable = [m for m in usable if not any(
             bad in m for bad in ("image", "video", "audio", "tts", "embedding",
                                  "veo", "imagen", "live", "native-audio"))]
@@ -523,7 +808,6 @@ def resolve_model():
             flash = "flash" in name
             lite = "lite" in name
             preview = "preview" in name or "exp" in name
-            # highest version number first, prefer stable non-lite flash
             digits = "".join(c if c.isdigit() else " " for c in name).split()
             ver = float(digits[0]) if digits else 0
             return (flash, not preview, not lite, ver)
@@ -539,19 +823,15 @@ def resolve_model():
 
 
 def ask_llm(question, sim, controls, history):
-    """Live Gemini call with the digital twin state injected as context."""
     key = get_api_key()
     if not key:
         return None, "no_key"
-
     model_id = resolve_model()
     if not model_id:
         return None, "no_model"
-
     try:
         from google import genai
         from google.genai import types
-
         client = genai.Client(api_key=key)
         contents = []
         for m in history[-8:]:
@@ -559,14 +839,9 @@ def ask_llm(question, sim, controls, history):
                 role="user" if m["role"] == "user" else "model",
                 parts=[types.Part(text=m["content"])]))
         contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
-
         sys_prompt = SYSTEM_PROMPT.format(context=build_context(sim, controls))
 
         def make_config(disable_thinking):
-            """Gemini 3.x models reason before answering and those thinking
-            tokens are charged against max_output_tokens. Left unchecked they
-            consume the whole budget and the visible answer is truncated
-            mid-sentence. We ask for minimal thinking and leave ample headroom."""
             kw = dict(system_instruction=sys_prompt, temperature=0.4,
                       max_output_tokens=2048)
             if disable_thinking:
@@ -577,17 +852,14 @@ def ask_llm(question, sim, controls, history):
             resp = client.models.generate_content(
                 model=model_id, contents=contents, config=make_config(True))
         except Exception:
-            # some models require thinking and reject a zero budget
             resp = client.models.generate_content(
                 model=model_id, contents=contents, config=make_config(False))
-
         text = extract_text(resp)
         if not text:
             return None, "empty"
         return text, "ok"
     except Exception as e:
         msg = str(e)
-        # a retired or unavailable model returns 404 / "limit: 0" - try the next one
         if ("404" in msg or "limit: 0" in msg) and "model_options" in st.session_state:
             opts = st.session_state.model_options
             if model_id in opts and opts.index(model_id) + 1 < len(opts):
@@ -598,11 +870,8 @@ def ask_llm(question, sim, controls, history):
 
 
 def offline_answer(question, sim, controls):
-    """Deterministic fallback. Unlike a keyword matcher, every number
-    here is read from the simulation core rather than invented."""
     q = question.lower()
     s1, s2, s3, s4 = sim["states"]
-
     if any(k in q for k in ["enthalpy", "total heat", "energy"]):
         return (f"Enthalpy at each point: intake {s1['h']:.2f}, after coil "
                 f"{s2['h']:.2f}, after reheat {s3['h']:.2f}, supply {s4['h']:.2f} kJ/kg. "
@@ -647,6 +916,129 @@ def offline_answer(question, sim, controls):
 
 
 # ==========================================================================
+# DATA INGESTION LAYER  (real-time sensor analytics scaffold)
+# ==========================================================================
+# The whole app reads from one `sim` dict of the shape simulate() returns. That
+# dict is produced from a *data source*, not from the sliders directly, so the
+# source can be swapped without touching the chart, tutor, diagnostics or
+# schematic. Two sources are provided:
+#
+#   SimSource  - the digital twin driven by the sidebar sliders (default).
+#   LiveSource - reads tagged sensor rows from a CSV feed in the rig's export
+#                format. Point it at the EDIBON data-management CSV (or later an
+#                MQTT / OPC-UA / nidaqmx bridge) and nothing downstream changes.
+#
+# In Live mode the four state points are built from *measured* sensor readings,
+# while simulate() runs alongside as the *theoretical* reference the chart
+# overlays them against - so "measured vs theoretical" becomes literally real.
+
+SENSOR_TAGS = ["ST-1", "SH-1", "ST-5", "SH-3", "ST-7", "SH-4",
+               "ST-9", "SH-5", "SC-1", "ST-13"]
+_APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() \
+    else os.getcwd()
+DEFAULT_FEED = os.path.join(_APP_DIR, "sample_sensor_feed.csv")
+
+
+class DataSource:
+    """Any source that can yield one frame of tagged sensor readings."""
+    def read(self):
+        raise NotImplementedError
+
+
+class SimSource(DataSource):
+    """Emit the slider-driven twin's state as tagged readings (transparency)."""
+    def __init__(self, sim, chw):
+        self.sim = sim
+        self.chw = chw
+
+    def read(self):
+        s = self.sim["states"]
+        return {
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "source": "sim", "row": None, "rows": None,
+            "ST-1": round(s[0]["t_db"], 2), "SH-1": round(s[0]["rh"], 1),
+            "ST-5": round(s[1]["t_db"], 2), "SH-3": round(s[1]["rh"], 1),
+            "ST-7": round(s[2]["t_db"], 2), "SH-4": round(s[2]["rh"], 1),
+            "ST-9": round(s[3]["t_db"], 2), "SH-5": round(s[3]["rh"], 1),
+            "SC-1": round(self.sim["airflow_actual"], 1), "ST-13": round(self.chw, 2),
+        }
+
+
+class LiveSource(DataSource):
+    """Read one frame from a CSV feed in the rig's sensor-tag format.
+
+    Swapping this file for the EDIBON data-management export - or replacing the
+    file read with an MQTT subscribe / OPC-UA read / nidaqmx sample - is the
+    only change needed to go from mock feed to real rig.
+    """
+    def __init__(self, path, row_index=None):
+        self.path = path
+        self.row_index = row_index          # None -> latest row
+
+    def read(self):
+        with open(self.path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            return None
+        idx = len(rows) - 1 if self.row_index is None else self.row_index % len(rows)
+        raw = rows[idx]
+        frame = {"source": "live", "row": idx + 1, "rows": len(rows),
+                 "timestamp": raw.get("timestamp", "")}
+        for tag in SENSOR_TAGS:
+            if tag in raw and raw[tag] not in ("", None):
+                frame[tag] = float(raw[tag])
+        missing = [t for t in SENSOR_TAGS if t not in frame]
+        if missing:
+            raise ValueError(f"feed missing sensor tags: {', '.join(missing)}")
+        return frame
+
+
+def states_from_readings(r):
+    """Build the four psychrometric state points from measured T + RH pairs."""
+    def st_pt(t, rh, label, tag):
+        w = psy.GetHumRatioFromRelHum(t, max(min(rh, 100.0), 1.0) / 100.0, P_ATM)
+        return state(t, w, label, tag)
+    return [
+        st_pt(r["ST-1"], r["SH-1"], "Intake air", "ST-1 / SH-1"),
+        st_pt(r["ST-5"], r["SH-3"], "After cooling coil", "ST-5 / SH-3"),
+        st_pt(r["ST-7"], r["SH-4"], "After reheat", "ST-7 / SH-4"),
+        st_pt(r["ST-9"], r["SH-5"], "Supply to chamber", "ST-9 / SH-5"),
+    ]
+
+
+def sim_from_readings(r):
+    """Assemble a simulate()-shaped dict from measured readings, so every
+    downstream consumer (KPIs, diagnostics, chart, tutor, schematic) works
+    unchanged. Coil bypass and ADP are *inferred* from the measured air temps,
+    since the coil surface itself is not directly sensed."""
+    s = states_from_readings(r)
+    s1, s2, s3 = s[0], s[1], s[2]
+    airflow = r.get("SC-1", 500.0)
+    chw = r.get("ST-13", 7.0)
+    m_dot = (airflow / 3600.0) / s1["v"]
+    cp_moist = CP_AIR + CP_VAP * s2["w"]
+    q_total = m_dot * (s1["h"] - s2["h"])
+    q_sens = m_dot * cp_moist * (s1["t_db"] - s2["t_db"])
+    q_lat = q_total - q_sens
+    shr = q_sens / q_total if abs(q_total) > 1e-6 else 0.0
+    condensate = max(m_dot * (s1["w"] - s2["w"]) * 3600.0, 0.0)
+    approach = 1.5                                   # nominal, chilled-water side
+    t_adp = chw + approach
+    denom = s1["t_db"] - t_adp
+    bypass = (s2["t_db"] - t_adp) / denom if abs(denom) > 0.2 else 0.12
+    bypass = min(max(bypass, 0.0), 1.0)              # inferred effective bypass
+    return {
+        "states": s, "m_dot": m_dot, "airflow_actual": airflow,
+        "t_adp": t_adp, "bypass": bypass, "approach": approach,
+        "q_total": q_total, "q_sens": q_sens, "q_lat": q_lat, "shr": shr,
+        "condensate": condensate,
+        "dehumidifying": (s1["w"] - s2["w"]) > 1e-5,
+        "heater_tripped": False, "dt_reheat_demand": s3["t_db"] - s2["t_db"],
+        "faults": [], "measured": True,
+    }
+
+
+# ==========================================================================
 # UI
 # ==========================================================================
 
@@ -654,8 +1046,41 @@ st.title("AI-Enabled Intelligent HVAC Learning Platform")
 st.caption("Real-Time Digital Twin | ASHRAE Psychrometrics | AI Assistant & Diagnostics")
 
 with st.sidebar:
+    st.header("Learning Mode")
+    mode = st.radio(
+        "Mode", ["Guided walkthrough", "Student self-learning", "Instructor demonstration"],
+        label_visibility="collapsed",
+        help="Instructor mode unlocks fault injection and quiz answer keys.")
+    instructor = mode == "Instructor demonstration"
+
+    st.divider()
+    st.header("Data Source")
+    data_mode = st.radio(
+        "Data source", ["Simulated (sliders)", "Live ingestion (sensor feed)"],
+        label_visibility="collapsed",
+        help="Live mode builds the measured state points from a CSV sensor feed "
+             "in the rig's export format. Swap the file for the EDIBON export "
+             "(or an MQTT/OPC-UA bridge) with no other change.")
+    live_mode = data_mode.startswith("Live")
+    feed_path = DEFAULT_FEED
+    if live_mode:
+        st.session_state.setdefault("feed_row", 0)
+        feed_path = st.text_input("Sensor feed CSV path", DEFAULT_FEED)
+        fc1, fc2 = st.columns(2)
+        if fc1.button("Advance feed", use_container_width=True):
+            st.session_state.feed_row = st.session_state.get("feed_row", 0) + 1
+        if fc2.button("Reset feed", use_container_width=True):
+            st.session_state.feed_row = 0
+        st.caption("Replays the mock feed row by row so the measured line moves "
+                   "as you step through it. A real feed streams new rows live.")
+
+    st.divider()
     st.header("Live Sensor Controls")
-    st.caption("Intake conditions")
+    if live_mode:
+        st.caption("Intake conditions come from the feed in Live mode; these "
+                   "sliders drive the theoretical reference model.")
+    else:
+        st.caption("Intake conditions")
     t_intake = st.slider("Intake Dry Bulb (deg C)", 15.0, 45.0, 32.0, 0.5)
     rh_intake = st.slider("Intake Relative Humidity (%)", 20.0, 95.0, 70.0, 1.0)
     airflow = st.slider("Airflow Setpoint (m3/h)", 100, 1000, 500, 25)
@@ -665,13 +1090,23 @@ with st.sidebar:
     reheat_kw = st.slider("Reheat Duty (kW)", 0.0, 5.0, 1.5, 0.1)
     humid_kgh = st.slider("Humidifier Output (kg/h)", 0.0, 6.0, 0.5, 0.1)
 
-    st.divider()
-    st.subheader("Fault Injection")
-    st.caption("Instructor mode: degrade the plant and see if students catch it.")
-    faults = st.multiselect(
-        "Inject fault", ["Fouled cooling coil", "Clogged air filter",
-                         "Fan belt slipping", "Low chilled water flow"],
-        label_visibility="collapsed")
+    faults, sensor_faults = [], []
+    if instructor:
+        st.divider()
+        st.subheader("Plant Fault Injection")
+        st.caption("Degrade the physical plant and see if students catch it.")
+        faults = st.multiselect(
+            "Plant fault", ["Fouled cooling coil", "Clogged air filter",
+                            "Fan belt slipping", "Low chilled water flow"],
+            label_visibility="collapsed")
+        st.subheader("Sensor Fault Injection")
+        st.caption("Corrupt a reading without touching the physics. Caught by "
+                   "physical-consistency checks, not by magnitude.")
+        sensor_faults = st.multiselect(
+            "Sensor fault", list(SENSOR_FAULTS.keys()), label_visibility="collapsed")
+    else:
+        st.divider()
+        st.caption("Fault injection is available in Instructor demonstration mode.")
 
     st.divider()
     if st.session_state.get("last_api_error"):
@@ -685,53 +1120,124 @@ with st.sidebar:
     else:
         st.caption("AI tutor: OFFLINE - no key")
 
-controls = {
-    "intake_dry_bulb_C": t_intake, "intake_RH_pct": rh_intake,
-    "airflow_setpoint": airflow, "chilled_water_C": t_chw,
-    "reheat_kW": reheat_kw, "humidifier_kg_h": humid_kgh,
-}
-sim = simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults)
-findings = diagnose(sim, airflow)
+# ---- resolve the active data source --------------------------------------
+feed_error = None
+readings = None
+if live_mode:
+    try:
+        src = LiveSource(feed_path, row_index=st.session_state.get("feed_row"))
+        readings = src.read()
+        sim = sim_from_readings(readings)
+        # theoretical reference: clean plant on the *measured* intake + setpoints
+        sim_ideal = simulate(readings["ST-1"], readings["SH-1"], readings["SC-1"],
+                             readings["ST-13"], reheat_kw, humid_kgh, [])
+        airflow_ref = readings["SC-1"]
+        faults, sensor_faults = [], []          # detected, not injected, in Live
+        controls = {
+            "intake_dry_bulb_C": round(readings["ST-1"], 1),
+            "intake_RH_pct": round(readings["SH-1"], 1),
+            "airflow_setpoint": round(readings["SC-1"], 0),
+            "chilled_water_C": round(readings["ST-13"], 1),
+            "reheat_kW": reheat_kw, "humidifier_kg_h": humid_kgh,
+            "data_source": "live sensor feed",
+        }
+    except Exception as e:
+        feed_error = str(e)
+        live_mode = False                        # graceful fallback to simulated
+
+if not live_mode:
+    controls = {
+        "intake_dry_bulb_C": t_intake, "intake_RH_pct": rh_intake,
+        "airflow_setpoint": airflow, "chilled_water_C": t_chw,
+        "reheat_kW": reheat_kw, "humidifier_kg_h": humid_kgh,
+        "data_source": "simulated (sliders)",
+    }
+    sim = simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, faults)
+    sim_ideal = simulate(t_intake, rh_intake, airflow, t_chw, reheat_kw, humid_kgh, [])
+    airflow_ref = airflow
+    readings = SimSource(sim, t_chw).read()
+
+findings = diagnose(sim, airflow_ref)
+reported, corrupted = apply_sensor_faults(sim, sensor_faults)
+sensor_findings = diagnose_sensors(sim, reported)
+
+if feed_error:
+    st.error(f"Live feed unavailable ({feed_error}). Fell back to simulated data.")
 
 # ---- diagnostics banner --------------------------------------------------
 st.subheader("Predictive Diagnostics & Anomaly Detection")
 for lvl, title, detail in findings:
-    {"error": st.error, "warn": st.warning, "ok": st.success}[lvl](
-        f"**{title}** - {detail}")
+    {"error": st.error, "warn": st.warning, "ok": st.success}[lvl](f"**{title}** - {detail}")
+if instructor or sensor_faults:
+    for lvl, title, detail in sensor_findings:
+        {"error": st.error, "warn": st.warning, "ok": st.success}[lvl](f"**{title}** - {detail}")
 
 k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Supply Air", f"{sim['states'][3]['t_db']:.1f} C",
           f"{sim['states'][3]['t_db'] - t_intake:+.1f} C vs intake")
 k2.metric("Supply RH", f"{sim['states'][3]['rh']:.0f} %")
-k3.metric("Coil Load", f"{sim['q_total']:.2f} kW",
-          f"SHR {sim['shr']:.2f}", delta_color="off")
+k3.metric("Coil Load", f"{sim['q_total']:.2f} kW", f"SHR {sim['shr']:.2f}",
+          delta_color="off")
 k4.metric("Condensate", f"{sim['condensate']:.2f} kg/h")
 k5.metric("Mass Flow", f"{sim['m_dot']:.3f} kg/s")
 
 st.divider()
 
-tab3, tab1, tab2 = st.tabs([
-    "WP3 - Psychrometric Visualization",
+tab1, tab2, tab3, tab_quiz = st.tabs([
     "WP1 - Immersive AHU Environment",
-    "WP2 - AI Learning Assistant"])
+    "WP2 - AI Learning Assistant",
+    "WP3 - Psychrometric Visualization",
+    "Student Quiz"])
 
 # ---- WP3 ------------------------------------------------------------------
 with tab3:
+    with st.expander(
+            ("LIVE" if live_mode else "SIMULATED") + " data source - "
+            + ("streaming from sensor feed" if live_mode else "digital twin (sliders)"),
+            expanded=live_mode):
+        if live_mode:
+            st.caption(f"Source: {readings['source']} | frame {readings['row']} of "
+                       f"{readings['rows']} | timestamp {readings['timestamp']}")
+            st.caption("Measured state points below are built from these raw sensor "
+                       "readings through the same ingestion pipeline the rig would use. "
+                       "Swap this file for the EDIBON export to go fully live.")
+        else:
+            st.caption("Running on the digital twin. Switch to Live ingestion in the "
+                       "sidebar to feed measured state points from a sensor CSV.")
+        st.dataframe([{
+            "ST-1": readings.get("ST-1"), "SH-1": readings.get("SH-1"),
+            "ST-5": readings.get("ST-5"), "SH-3": readings.get("SH-3"),
+            "ST-7": readings.get("ST-7"), "SH-4": readings.get("SH-4"),
+            "ST-9": readings.get("ST-9"), "SH-5": readings.get("SH-5"),
+            "SC-1": readings.get("SC-1"), "ST-13": readings.get("ST-13"),
+        }], hide_index=True, use_container_width=True)
+
     c1, c2 = st.columns([3, 2])
     with c1:
-        st.plotly_chart(psych_chart(sim), use_container_width=True)
-        st.caption("Solid blue = saturation curve. Dotted grey = constant RH. "
-                   "Dashed purple = constant enthalpy. Red X = apparatus dew point.")
+        st.plotly_chart(psych_chart(sim, sim_ideal), use_container_width=True)
+        st.caption("Red = actual measured process. Dashed green = theoretical "
+                   "clean-plant process for the same setpoints. When they diverge, "
+                   "the plant is deviating from ideal - inject a fault to see it open up.")
+
+        st.markdown("**AI decision support - operation & optimisation**")
+        for pri, text in recommend(sim, controls):
+            {"high": st.error, "med": st.warning, "ok": st.success}.get(
+                pri, st.info)(text)
     with c2:
         st.markdown("**State point properties**")
-        st.dataframe([{
-            "Pt": i + 1, "Location": s["label"], "Tag": s["tag"],
-            "T db (C)": round(s["t_db"], 1), "RH (%)": round(s["rh"], 1),
-            "W (g/kg)": round(s["w"] * 1000, 2), "h (kJ/kg)": round(s["h"], 2),
-            "T dp (C)": round(s["t_dp"], 1), "T wb (C)": round(s["t_wb"], 1),
-            "v (m3/kg)": round(s["v"], 4),
-        } for i, s in enumerate(sim["states"])], hide_index=True,
-            use_container_width=True)
+        if instructor or sensor_faults:
+            st.caption("Values shown are the *reported* readings. Cells flagged with a "
+                       "warning are corrupted by an injected sensor fault.")
+        rows = []
+        for i, s in enumerate(reported):
+            flag = " (!)" if corrupted.get(i) else ""
+            rows.append({
+                "Pt": i + 1, "Location": s["label"], "Tag": s["tag"] + flag,
+                "T db (C)": round(s["t_db"], 1), "RH (%)": round(s["rh"], 1),
+                "W (g/kg)": round(s["w"] * 1000, 2), "h (kJ/kg)": round(s["h"], 2),
+                "T dp (C)": round(s["t_dp"], 1), "T wb (C)": round(s["t_wb"], 1),
+                "v (m3/kg)": round(s["v"], 4)})
+        st.dataframe(rows, hide_index=True, use_container_width=True)
 
         st.markdown("**Cooling coil heat transfer**")
         st.dataframe([
@@ -743,37 +1249,63 @@ with tab3:
             {"Quantity": "Bypass factor", "Value": f"{sim['bypass']:.3f}"},
         ], hide_index=True, use_container_width=True)
 
-        st.download_button(
-            "Export analysis (JSON)", build_context(sim, controls),
-            file_name="hvac_analysis.json", mime="application/json",
-            use_container_width=True)
+        # CSV export of state points
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["point", "location", "tag", "t_db_C", "rh_pct", "w_g_kg",
+                    "h_kJ_kg", "t_dp_C", "t_wb_C", "v_m3_kg"])
+        for i, s in enumerate(sim["states"]):
+            w.writerow([i + 1, s["label"], s["tag"], round(s["t_db"], 2),
+                        round(s["rh"], 1), round(s["w"] * 1000, 3), round(s["h"], 2),
+                        round(s["t_dp"], 2), round(s["t_wb"], 2), round(s["v"], 4)])
+        e1, e2 = st.columns(2)
+        e1.download_button("Export state points (CSV)", buf.getvalue(),
+                           file_name="hvac_state_points.csv", mime="text/csv",
+                           use_container_width=True)
+        e2.download_button("Export analysis (JSON)", build_context(sim, controls),
+                           file_name="hvac_analysis.json", mime="application/json",
+                           use_container_width=True)
+        st.caption("Charts export to PNG from the camera icon on the chart toolbar.")
 
 # ---- WP1 ------------------------------------------------------------------
 with tab1:
-    st.markdown("**Live AHU cutaway** - airflow speed, coil condensate and every "
-                "sensor badge are driven by the same simulation core as the chart.")
-    # components.v1.html renders in an iframe with no sanitisation, so the
-    # SVG animation tags survive. st.html() strips them and shows nothing.
-    components.html(ahu_svg(sim), height=600, scrolling=False)
-    st.caption("Streamline animation rate scales with delivered airflow. Droplets "
-               "appear only when the coil surface falls below the intake dew point. "
-               "The coil outline turns red when its bypass factor degrades.")
+    st.markdown("**Live AHU cutaway** - airflow, coil condensate, the chilled-water "
+                "loop and the chiller's vapour-compression cycle are all driven by the "
+                "same simulation core as the chart.")
 
-    with st.expander("Component walkthrough"):
-        for s, txt in zip(sim["states"], [
-            "Ambient air is drawn in past ST-1/SH-1. This is state point 1 and fixes "
-            "the intake dew point, which decides whether the coil can dehumidify.",
-            "The cooling coil cools air toward its apparatus dew point. Air that "
-            "contacts the fins is saturated at ADP; the rest bypasses untreated. "
-            "Mixing the two gives the outlet state.",
-            "The electric reheater adds sensible heat only. On the chart this moves "
-            "horizontally to the right: humidity ratio is unchanged, RH falls.",
-            "The humidifier injects steam, raising humidity ratio at nearly constant "
-            "dry bulb. On the chart this is a near-vertical rise."]):
-            st.markdown(f"**{s['label']}** ({s['tag']}) - {s['t_db']:.1f} deg C, "
-                        f"{s['rh']:.0f}% RH, {s['w']*1000:.2f} g/kg  \n{txt}")
+    selected = st.selectbox("Select a component to inspect", COMPONENTS, index=2)
+    components.html(ahu_svg(sim, selected), height=560, scrolling=False)
+    st.info(component_detail(selected, sim))
+    st.caption("Streamline animation rate scales with delivered airflow. Droplets appear "
+               "only when the coil surface falls below the intake dew point. The coil "
+               "outline turns red when its bypass factor degrades. Chilled-water flow "
+               "animates from coil to chiller and back.")
 
-# ---- WP2 ------------------------------------------------------------------
+    if mode == "Guided walkthrough":
+        st.markdown("### Guided walkthrough")
+        steps = [
+            ("Intake", "Ambient air is drawn in past ST-1/SH-1. This fixes the intake "
+                       "dew point, which decides whether the coil can dehumidify."),
+            ("Cooling coil", "The coil cools air toward its apparatus dew point. Air "
+                             "that contacts the fins leaves saturated at ADP; the rest "
+                             "bypasses untreated. Mixing gives the outlet state."),
+            ("Reheater", "The electric reheater adds sensible heat only - a horizontal "
+                         "move right on the chart. Humidity ratio is unchanged, RH falls."),
+            ("Humidifier", "The humidifier injects steam, raising humidity ratio at "
+                           "nearly constant dry bulb - a near-vertical rise."),
+        ]
+        for name, txt in steps:
+            with st.expander(f"Step: {name}"):
+                st.markdown(component_detail(name, sim))
+                st.markdown(txt)
+    elif mode == "Instructor demonstration":
+        st.markdown("### Instructor notes")
+        st.markdown("Inject a plant or sensor fault from the sidebar and ask students to "
+                    "read the schematic and diagnostics before you reveal the cause. The "
+                    "coil turns red for a fouled coil; the chart's actual vs theoretical "
+                    "paths separate; sensor faults surface as physical-consistency errors.")
+
+# ---- WP2 (student quiz lives here too) ------------------------------------
 with tab2:
     hcol, bcol = st.columns([4, 1])
     hcol.markdown("**Context-aware tutor.** The full digital twin state is injected "
@@ -791,7 +1323,7 @@ with tab2:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    box = st.container(height=340)
+    box = st.container(height=320)
     with box:
         if not st.session_state.messages:
             st.chat_message("assistant").write(
@@ -817,3 +1349,46 @@ with tab2:
         st.session_state.messages.append({"role": "assistant", "content": reply})
         with box:
             st.chat_message("assistant").write(reply)
+
+# ---- Student Quiz (own tab) ----------------------------------------------
+with tab_quiz:
+    st.markdown("### Student Quiz")
+    st.caption("Questions marked (live) are generated from the current rig state, so the "
+               "answer changes as you adjust the plant. Answer keys appear in "
+               "Instructor demonstration mode.")
+    quiz = build_quiz(sim)
+    if "quiz_responses" not in st.session_state:
+        st.session_state.quiz_responses = {}
+
+    name = st.text_input("Student name (for the export record)", "")
+    responses = {}
+    for n, item in enumerate(quiz, 1):
+        live = " (live)" if item["id"] in ("q1", "q2", "q5") else ""
+        if item["type"] == "num":
+            responses[item["id"]] = st.text_input(f"Q{n}{live}. {item['q']}", key=item["id"])
+        else:
+            responses[item["id"]] = st.radio(
+                f"Q{n}{live}. {item['q']}", item["options"], key=item["id"], index=None)
+        if instructor:
+            st.caption(f"Answer key: {item['answer']} - {item['why']}")
+
+    if st.button("Submit quiz"):
+        score, results = grade_quiz(quiz, responses)
+        st.success(f"Score: {score} / {len(quiz)}")
+        for r in results:
+            (st.success if r["correct"] else st.error)(
+                f"{'Correct' if r['correct'] else 'Review'}: {r['question']}  \n"
+                f"Your answer: {r['your_answer']} | Correct: {r['correct_answer']}  \n"
+                f"{r['explanation']}")
+        record = {
+            "student": name or "anonymous",
+            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+            "mode": mode,
+            "rig_state": json.loads(build_context(sim, controls)),
+            "score": score, "out_of": len(quiz), "results": results,
+        }
+        st.download_button(
+            "Export quiz result (JSON)", json.dumps(record, indent=2),
+            file_name="hvac_quiz_result.json", mime="application/json")
+        st.caption("Export target: local workstation download, or wire this JSON to an "
+                   "institutional LMS / cloud endpoint.")
