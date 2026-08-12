@@ -377,16 +377,19 @@ def psych_chart(sim, sim_ideal=None, selected_pt=None):
                                      hoverinfo="skip",
                                      line=dict(color="#6b5b8a", width=0.6, dash="dash")))
 
-    # theoretical (clean-plant) process - dashed grey-green, drawn first
+    # theoretical (clean-plant) process - dashed green, drawn first
     if sim_ideal is not None:
         ip = sim_ideal["states"]
         fig.add_trace(go.Scatter(
             x=[p["t_db"] for p in ip], y=[p["w"] * 1000 for p in ip],
-            mode="lines+markers", line=dict(color="#06d6a0", width=2, dash="dash"),
-            marker=dict(size=9, color="#06d6a0", symbol="circle-open",
-                        line=dict(width=1.5)),
+            mode="lines+markers+text", line=dict(color="#06d6a0", width=3, dash="dash"),
+            marker=dict(size=20, color="rgba(6,214,160,0.12)", symbol="circle",
+                        line=dict(width=2, color="#06d6a0")),
+            text=[str(i + 1) for i in range(len(ip))], textposition="middle center",
+            textfont=dict(size=10, color="#06d6a0"),
             name="Theoretical (clean plant)",
-            hovertemplate="Theoretical<br>%{x:.1f} C, %{y:.2f} g/kg<extra></extra>"))
+            hovertemplate="Theoretical point %{text}<br>%{x:.1f} C, "
+                          "%{y:.2f} g/kg<extra></extra>"))
 
     # actual (measured) process line
     pts = sim["states"]
