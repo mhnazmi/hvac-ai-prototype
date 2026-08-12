@@ -1338,8 +1338,8 @@ st.divider()
 
 tab1, tab2, tab3, tab_quiz = st.tabs([
     "WP1 - Immersive AHU Environment",
-    "WP2 - AI Learning Assistant",
-    "WP3 - Psychrometric Visualization",
+    "WP2 - Psychrometric Visualization",
+    "WP3 - AI Learning Assistant",
     "Student Quiz"])
 
 # ---- WP3 ------------------------------------------------------------------
